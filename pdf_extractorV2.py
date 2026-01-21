@@ -8,6 +8,7 @@ import re
 import logging
 from pathlib import Path
 from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import fitz  # PyMuPDF
 from PIL import Image, ImageEnhance, ImageFilter
 import pytesseract
@@ -53,6 +54,13 @@ class PDFTextExtractor:
         self.api_url = config.get('Settings', 'api_log_url', 
                                   fallback='http://mth-vm-pdw/pdw-picklist-api/api/PDW/AddExtractionLog')
         self.enable_api_logging = config.getboolean('Settings', 'enable_api_logging', fallback=True)
+        
+        # Performance optimization settings
+        self.enable_parallel_processing = config.getboolean('Settings', 'enable_parallel_processing', fallback=True)
+        self.max_workers = config.getint('Settings', 'max_workers', fallback=4)
+        
+        # Method execution order (best performing methods first for better user feedback)
+        self.method_priority = ['method2', 'method3', 'method4', 'method5', 'method1', 'method6', 'method0B', 'method0C', 'method7', 'method0']
         
     def extract_header_text(self, pdf_path):
         """
@@ -278,6 +286,7 @@ class PDFTextExtractor:
     def _try_multiple_ocr_methods(self, img):
         """
         Try multiple preprocessing methods to extract text
+        Uses parallel processing for speed improvement
         
         Args:
             img: PIL Image object
@@ -290,276 +299,264 @@ class PDFTextExtractor:
         results = []
         method_results = {}
         
-        # Convert PIL to OpenCV format
+        # Convert PIL to OpenCV format (shared across all methods)
         img_cv = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
         gray = cv2.cvtColor(img_cv, cv2.COLOR_BGR2GRAY)
         
         # Tesseract config for single line with specific characters
         custom_config = '--psm 7 --oem 3 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-'
         
-        # Method 0: Advanced Line Removal with Hough Transform (NEW - BEST FOR SCRIBBLES)
-        try:
-            logger.info("Trying Method 0 (Hough line removal)...")
-            
-            # Threshold
-            _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
-            
-            # Detect lines using Hough Line Transform
-            edges = cv2.Canny(binary, 50, 150, apertureSize=3)
-            lines = cv2.HoughLinesP(edges, 1, np.pi/180, threshold=30, minLineLength=20, maxLineGap=5)
-            
-            # Create mask for lines
-            line_mask = np.zeros_like(binary)
-            if lines is not None:
-                for line in lines:
-                    x1, y1, x2, y2 = line[0]
-                    # Draw thick lines to remove
-                    cv2.line(line_mask, (x1, y1), (x2, y2), 255, 3)
-            
-            # Remove lines from original
-            result = cv2.subtract(binary, line_mask)
-            
-            # Clean up with morphology
-            kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2))
-            result = cv2.morphologyEx(result, cv2.MORPH_CLOSE, kernel)
-            result = cv2.bitwise_not(result)
-            
-            cv2.imwrite("debug_method0_hough.png", result)
-            text = pytesseract.image_to_string(result, lang='eng', config=custom_config).strip()
-            score = self._validate_and_score_result(text) if text else -1
-            method_results['method0'] = {'text': text, 'score': score}
-            if text and len(text) > 3:
-                results.append(text)
-                logger.info(f"Method 0 (Hough): {text}")
-        except Exception as e:
-            logger.error(f"Method 0 failed: {e}", exc_info=True)
-            method_results['method0'] = {'text': '', 'score': -1}
+        # Define all methods with their execution functions
+        method_functions = {
+            'method0': self._method0_hough,
+            'method0B': self._method0B_contrast,
+            'method0C': self._method0C_opening,
+            'method7': self._method7_median,
+            'method1': self._method1_lineremoval,
+            'method2': self._method2_threshold,
+            'method3': self._method3_adaptive,
+            'method4': self._method4_otsu,
+            'method5': self._method5_bilateral,
+            'method6': self._method6_blackhat
+        }
         
-        # Method 0B: Contrast enhancement with sharpening
-        try:
-            logger.info("Trying Method 0B (contrast + sharpen)...")
+        if self.enable_parallel_processing:
+            # PARALLEL EXECUTION - All methods run simultaneously
+            logger.info(f"[PARALLEL] Running {len(self.method_priority)} methods in parallel (max {self.max_workers} workers)...")
             
-            # Apply CLAHE (Contrast Limited Adaptive Histogram Equalization)
-            clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
-            enhanced = clahe.apply(gray)
-            
-            # Sharpen the image
-            kernel_sharpen = np.array([[-1, -1, -1],
-                                      [-1,  9, -1],
-                                      [-1, -1, -1]])
-            sharpened = cv2.filter2D(enhanced, -1, kernel_sharpen)
-            
-            # Apply threshold
-            _, thresh = cv2.threshold(sharpened, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-            
-            cv2.imwrite("debug_method0B_contrast.png", thresh)
-            text = pytesseract.image_to_string(thresh, lang='eng', config=custom_config).strip()
-            score = self._validate_and_score_result(text) if text else -1
-            method_results['method0B'] = {'text': text, 'score': score}
-            if text and len(text) > 3:
-                results.append(text)
-                logger.info(f"Method 0B (contrast): {text}")
-        except Exception as e:
-            logger.error(f"Method 0B failed: {e}", exc_info=True)
-            method_results['method0B'] = {'text': '', 'score': -1}
+            with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+                # Submit all methods for parallel execution
+                future_to_method = {
+                    executor.submit(method_functions[method_name], gray, custom_config): method_name
+                    for method_name in self.method_priority
+                    if method_name in method_functions
+                }
+                
+                # Collect results as they complete
+                for future in as_completed(future_to_method):
+                    method_name = future_to_method[future]
+                    try:
+                        text, score = future.result()
+                        method_results[method_name] = {'text': text, 'score': score}
+                        
+                        if text and len(text) > 3 and score >= 0:
+                            results.append(text)
+                            logger.info(f"  [OK] {method_name}: '{text}' (score: {score})")
+                        else:
+                            logger.info(f"  [SKIP] {method_name}: No valid result (score: {score})")
+                            
+                    except Exception as e:
+                        logger.error(f"{method_name} failed: {e}")
+                        method_results[method_name] = {'text': '', 'score': -1}
+        else:
+            # SEQUENTIAL EXECUTION - One method at a time
+            logger.info("Running methods sequentially...")
+            for method_name in self.method_priority:
+                if method_name not in method_functions:
+                    continue
+                    
+                try:
+                    text, score = method_functions[method_name](gray, custom_config)
+                    method_results[method_name] = {'text': text, 'score': score}
+                    
+                    if text and len(text) > 3 and score >= 0:
+                        results.append(text)
+                        logger.info(f"  [OK] {method_name}: '{text}' (score: {score})")
+                    else:
+                        logger.info(f"  [SKIP] {method_name}: No result (score: {score})")
+                        
+                except Exception as e:
+                    logger.error(f"{method_name} failed: {e}")
+                    method_results[method_name] = {'text': '', 'score': -1}
         
-        # Method 0C: Morphological opening with erosion-dilation
-        try:
-            logger.info("Trying Method 0C (morphological opening)...")
-            
-            # Apply Gaussian blur
-            blurred = cv2.GaussianBlur(gray, (5, 5), 0)
-            
-            # Apply threshold
-            _, binary = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-            
-            # Morphological opening (erosion followed by dilation)
-            kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2, 2))
-            opening = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel, iterations=1)
-            
-            # Dilate slightly to make text bolder
-            dilate_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2))
-            result = cv2.dilate(opening, dilate_kernel, iterations=1)
-            
-            cv2.imwrite("debug_method0C_opening.png", result)
-            text = pytesseract.image_to_string(result, lang='eng', config=custom_config).strip()
-            score = self._validate_and_score_result(text) if text else -1
-            method_results['method0C'] = {'text': text, 'score': score}
-            if text and len(text) > 3:
-                results.append(text)
-                logger.info(f"Method 0C (opening): {text}")
-        except Exception as e:
-            logger.error(f"Method 0C failed: {e}", exc_info=True)
-            method_results['method0C'] = {'text': '', 'score': -1}
+        logger.info(f"\n[STATS] Total results found: {len(results)}")
         
-        # Method 7: Median blur with Otsu threshold
-        try:
-            logger.info("Trying Method 7 (median blur + Otsu)...")
-            
-            # Apply median blur to remove noise while preserving edges
-            median = cv2.medianBlur(gray, 3)
-            
-            # Apply Otsu thresholding
-            _, thresh = cv2.threshold(median, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-            
-            # Light morphological closing to connect broken characters
-            kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 1))
-            result = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel, iterations=1)
-            
-            cv2.imwrite("debug_method7_median.png", result)
-            text = pytesseract.image_to_string(result, lang='eng', config=custom_config).strip()
-            score = self._validate_and_score_result(text) if text else -1
-            method_results['method7'] = {'text': text, 'score': score}
-            if text and len(text) > 3:
-                results.append(text)
-                logger.info(f"Method 7 (median): {text}")
-        except Exception as e:
-            logger.error(f"Method 7 failed: {e}", exc_info=True)
-            method_results['method7'] = {'text': '', 'score': -1}
-        
-        # Method 1: Remove lines/scribbles using morphological operations
-        try:
-            logger.info("Trying Method 1 (line removal)...")
-            _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-            inverted = cv2.bitwise_not(binary)
-            
-            # Remove horizontal lines
-            horizontal_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (40, 1))
-            detect_horizontal = cv2.morphologyEx(inverted, cv2.MORPH_OPEN, horizontal_kernel, iterations=2)
-            cnts = cv2.findContours(detect_horizontal, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-            cnts = cnts[0] if len(cnts) == 2 else cnts[1]
-            for c in cnts:
-                cv2.drawContours(inverted, [c], -1, (0, 0, 0), 5)
-            
-            kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
-            opening = cv2.morphologyEx(inverted, cv2.MORPH_OPEN, kernel, iterations=1)
-            result = cv2.bitwise_not(opening)
-            
-            cv2.imwrite("debug_method1_lineremoval.png", result)
-            text = pytesseract.image_to_string(result, lang='eng', config=custom_config).strip()
-            score = self._validate_and_score_result(text) if text else -1
-            method_results['method1'] = {'text': text, 'score': score}
-            if text and len(text) > 3:
-                results.append(text)
-                logger.info(f"Method 1 (line removal): {text}")
-        except Exception as e:
-            logger.error(f"Method 1 failed: {e}", exc_info=True)
-            method_results['method1'] = {'text': '', 'score': -1}
-        
-        # Method 2: High threshold for bold text
-        try:
-            logger.info("Trying Method 2 (high threshold)...")
-            _, thresh = cv2.threshold(gray, 200, 255, cv2.THRESH_BINARY)
-            cv2.imwrite("debug_method2_threshold.png", thresh)
-            text = pytesseract.image_to_string(thresh, lang='eng', config=custom_config).strip()
-            score = self._validate_and_score_result(text) if text else -1
-            method_results['method2'] = {'text': text, 'score': score}
-            if text and len(text) > 3:
-                results.append(text)
-                logger.info(f"Method 2 (high threshold): {text}")
-        except Exception as e:
-            logger.error(f"Method 2 failed: {e}", exc_info=True)
-            method_results['method2'] = {'text': '', 'score': -1}
-        
-        # Method 3: Adaptive threshold
-        try:
-            logger.info("Trying Method 3 (adaptive threshold)...")
-            adaptive = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
-                                            cv2.THRESH_BINARY, 11, 2)
-            cv2.imwrite("debug_method3_adaptive.png", adaptive)
-            text = pytesseract.image_to_string(adaptive, lang='eng', config=custom_config).strip()
-            score = self._validate_and_score_result(text) if text else -1
-            method_results['method3'] = {'text': text, 'score': score}
-            if text and len(text) > 3:
-                results.append(text)
-                logger.info(f"Method 3 (adaptive): {text}")
-        except Exception as e:
-            logger.error(f"Method 3 failed: {e}", exc_info=True)
-            method_results['method3'] = {'text': '', 'score': -1}
-        
-        # Method 4: OTSU with denoising
-        try:
-            logger.info("Trying Method 4 (OTSU)...")
-            denoised = cv2.fastNlMeansDenoising(gray, None, 10, 7, 21)
-            _, thresh = cv2.threshold(denoised, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-            cv2.imwrite("debug_method4_otsu.png", thresh)
-            text = pytesseract.image_to_string(thresh, lang='eng', config=custom_config).strip()
-            score = self._validate_and_score_result(text) if text else -1
-            method_results['method4'] = {'text': text, 'score': score}
-            if text and len(text) > 3:
-                results.append(text)
-                logger.info(f"Method 4 (OTSU): {text}")
-        except Exception as e:
-            logger.error(f"Method 4 failed: {e}", exc_info=True)
-            method_results['method4'] = {'text': '', 'score': -1}
-        
-        # Method 5: Bilateral filter
-        try:
-            logger.info("Trying Method 5 (bilateral filter)...")
-            filtered = cv2.bilateralFilter(gray, 9, 75, 75)
-            _, thresh = cv2.threshold(filtered, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-            cv2.imwrite("debug_method5_bilateral.png", thresh)
-            text = pytesseract.image_to_string(thresh, lang='eng', config=custom_config).strip()
-            score = self._validate_and_score_result(text) if text else -1
-            method_results['method5'] = {'text': text, 'score': score}
-            if text and len(text) > 3:
-                results.append(text)
-                logger.info(f"Method 5 (bilateral): {text}")
-        except Exception as e:
-            logger.error(f"Method 5 failed: {e}", exc_info=True)
-            method_results['method5'] = {'text': '', 'score': -1}
-        
-        # Method 6: Black Hat transform to find dark text
-        try:
-            logger.info("Trying Method 6 (black hat)...")
-            kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (13, 5))
-            blackhat = cv2.morphologyEx(gray, cv2.MORPH_BLACKHAT, kernel)
-            _, thresh = cv2.threshold(blackhat, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-            cv2.imwrite("debug_method6_blackhat.png", thresh)
-            text = pytesseract.image_to_string(thresh, lang='eng', config=custom_config).strip()
-            score = self._validate_and_score_result(text) if text else -1
-            method_results['method6'] = {'text': text, 'score': score}
-            if text and len(text) > 3:
-                results.append(text)
-                logger.info(f"Method 6 (black hat): {text}")
-        except Exception as e:
-            logger.error(f"Method 6 failed: {e}", exc_info=True)
-            method_results['method6'] = {'text': '', 'score': -1}
-        
-        logger.info(f"Total results found: {len(results)}")
-        logger.info(f"All results: {results}")
-        
-        # Score and validate all results
+        # Analyze all results to find the best one
         if results:
-            logger.info("Scoring results based on format validation:")
+            from collections import Counter
+            frequency = Counter(results)
+            logger.info(f"Result frequencies: {dict(frequency)}")
+            
+            # Score all unique results
             scored_results = []
-            for text in results:
+            for text in set(results):
                 score = self._validate_and_score_result(text)
                 if score >= 0:
-                    scored_results.append((score, text))
+                    scored_results.append((score, frequency[text], text))
             
             if scored_results:
-                # Count frequency of each result (for majority voting)
-                from collections import Counter
-                result_texts = [text for score, text in scored_results]
-                frequency = Counter(result_texts)
-                logger.info(f"Result frequencies: {dict(frequency)}")
-                
-                # Sort by:
-                # 1. Score (highest first)
-                # 2. Frequency/count (most common first) 
-                # 3. Length (shorter is better, fewer errors)
-                scored_results.sort(key=lambda x: (x[0], frequency[x[1]], -len(x[1])), reverse=True)
-                
-                best_result = scored_results[0][1]
+                # Sort by: 1) Score (desc), 2) Frequency (desc), 3) Length (asc)
+                scored_results.sort(key=lambda x: (x[0], x[1], -len(x[2])), reverse=True)
+                best_result = scored_results[0][2]
                 best_score = scored_results[0][0]
-                best_frequency = frequency[best_result]
+                best_freq = scored_results[0][1]
                 
-                logger.info(f"Best result selected: {best_result} (score: {best_score}, frequency: {best_frequency}/{len(results)})")
+                logger.info(f"\n[BEST] Best result: '{best_result}' (score: {best_score}, frequency: {best_freq}/{len(results)})")
+                
+                # Show top 3 alternatives if available
+                if len(scored_results) > 1:
+                    logger.info("Top alternatives:")
+                    for i, (score, freq, text) in enumerate(scored_results[1:4], 2):
+                        logger.info(f"  {i}. '{text}' (score: {score}, freq: {freq})")
+                
                 return best_result, method_results
         
-        logger.warning("No valid results from any method")
+        logger.warning("[FAIL] No valid results from any method")
         return "", method_results
+    
+    # ========== OCR Method Implementations ==========
+    
+    def _method2_threshold(self, gray, custom_config):
+        """Method 2: High threshold for bold text (FAST)"""
+        logger.info("[M2] Method 2 (high threshold)...")
+        _, thresh = cv2.threshold(gray, 200, 255, cv2.THRESH_BINARY)
+        cv2.imwrite("debug_method2_threshold.png", thresh)
+        text = pytesseract.image_to_string(thresh, lang='eng', config=custom_config).strip()
+        score = self._validate_and_score_result(text) if text else -1
+        logger.info(f"  Method 2: '{text}' (score: {score})")
+        return text, score
+    
+    def _method3_adaptive(self, gray, custom_config):
+        """Method 3: Adaptive threshold (FAST)"""
+        logger.info("[M3] Method 3 (adaptive threshold)...")
+        adaptive = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
+                                        cv2.THRESH_BINARY, 11, 2)
+        cv2.imwrite("debug_method3_adaptive.png", adaptive)
+        text = pytesseract.image_to_string(adaptive, lang='eng', config=custom_config).strip()
+        score = self._validate_and_score_result(text) if text else -1
+        logger.info(f"  Method 3: '{text}' (score: {score})")
+        return text, score
+    
+    def _method4_otsu(self, gray, custom_config):
+        """Method 4: OTSU with denoising (MEDIUM SPEED)"""
+        logger.info("[M4] Method 4 (OTSU + denoise)...")
+        denoised = cv2.fastNlMeansDenoising(gray, None, 10, 7, 21)
+        _, thresh = cv2.threshold(denoised, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        cv2.imwrite("debug_method4_otsu.png", thresh)
+        text = pytesseract.image_to_string(thresh, lang='eng', config=custom_config).strip()
+        score = self._validate_and_score_result(text) if text else -1
+        logger.info(f"  Method 4: '{text}' (score: {score})")
+        return text, score
+    
+    def _method5_bilateral(self, gray, custom_config):
+        """Method 5: Bilateral filter (MEDIUM SPEED)"""
+        logger.info("[M5] Method 5 (bilateral filter)...")
+        filtered = cv2.bilateralFilter(gray, 9, 75, 75)
+        _, thresh = cv2.threshold(filtered, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        cv2.imwrite("debug_method5_bilateral.png", thresh)
+        text = pytesseract.image_to_string(thresh, lang='eng', config=custom_config).strip()
+        score = self._validate_and_score_result(text) if text else -1
+        logger.info(f"  Method 5: '{text}' (score: {score})")
+        return text, score
+    
+    def _method1_lineremoval(self, gray, custom_config):
+        """Method 1: Line removal (MEDIUM SPEED)"""
+        logger.info("[M1] Method 1 (line removal)...")
+        _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        inverted = cv2.bitwise_not(binary)
+        
+        horizontal_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (40, 1))
+        detect_horizontal = cv2.morphologyEx(inverted, cv2.MORPH_OPEN, horizontal_kernel, iterations=2)
+        cnts = cv2.findContours(detect_horizontal, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        cnts = cnts[0] if len(cnts) == 2 else cnts[1]
+        for c in cnts:
+            cv2.drawContours(inverted, [c], -1, (0, 0, 0), 5)
+        
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+        opening = cv2.morphologyEx(inverted, cv2.MORPH_OPEN, kernel, iterations=1)
+        result = cv2.bitwise_not(opening)
+        
+        cv2.imwrite("debug_method1_lineremoval.png", result)
+        text = pytesseract.image_to_string(result, lang='eng', config=custom_config).strip()
+        score = self._validate_and_score_result(text) if text else -1
+        logger.info(f"  Method 1: '{text}' (score: {score})")
+        return text, score
+    
+    def _method6_blackhat(self, gray, custom_config):
+        """Method 6: Black hat transform (FAST)"""
+        logger.info("[M6] Method 6 (black hat)...")
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (13, 5))
+        blackhat = cv2.morphologyEx(gray, cv2.MORPH_BLACKHAT, kernel)
+        _, thresh = cv2.threshold(blackhat, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        cv2.imwrite("debug_method6_blackhat.png", thresh)
+        text = pytesseract.image_to_string(thresh, lang='eng', config=custom_config).strip()
+        score = self._validate_and_score_result(text) if text else -1
+        logger.info(f"  Method 6: '{text}' (score: {score})")
+        return text, score
+    
+    def _method0B_contrast(self, gray, custom_config):
+        """Method 0B: Contrast enhancement (MEDIUM SPEED)"""
+        logger.info("[M0B] Method 0B (contrast + sharpen)...")
+        clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+        enhanced = clahe.apply(gray)
+        
+        kernel_sharpen = np.array([[-1, -1, -1], [-1, 9, -1], [-1, -1, -1]])
+        sharpened = cv2.filter2D(enhanced, -1, kernel_sharpen)
+        
+        _, thresh = cv2.threshold(sharpened, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        cv2.imwrite("debug_method0B_contrast.png", thresh)
+        text = pytesseract.image_to_string(thresh, lang='eng', config=custom_config).strip()
+        score = self._validate_and_score_result(text) if text else -1
+        logger.info(f"  Method 0B: '{text}' (score: {score})")
+        return text, score
+    
+    def _method0C_opening(self, gray, custom_config):
+        """Method 0C: Morphological opening (FAST)"""
+        logger.info("[M0C] Method 0C (opening)...")
+        blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+        _, binary = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2, 2))
+        opening = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel, iterations=1)
+        
+        dilate_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2))
+        result = cv2.dilate(opening, dilate_kernel, iterations=1)
+        
+        cv2.imwrite("debug_method0C_opening.png", result)
+        text = pytesseract.image_to_string(result, lang='eng', config=custom_config).strip()
+        score = self._validate_and_score_result(text) if text else -1
+        logger.info(f"  Method 0C: '{text}' (score: {score})")
+        return text, score
+    
+    def _method7_median(self, gray, custom_config):
+        """Method 7: Median blur (FAST)"""
+        logger.info("[M7] Method 7 (median blur)...")
+        median = cv2.medianBlur(gray, 3)
+        _, thresh = cv2.threshold(median, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 1))
+        result = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel, iterations=1)
+        
+        cv2.imwrite("debug_method7_median.png", result)
+        text = pytesseract.image_to_string(result, lang='eng', config=custom_config).strip()
+        score = self._validate_and_score_result(text) if text else -1
+        logger.info(f"  Method 7: '{text}' (score: {score})")
+        return text, score
+    
+    def _method0_hough(self, gray, custom_config):
+        """Method 0: Hough line removal (SLOW - for difficult cases)"""
+        logger.info("[M0] Method 0 (Hough line removal)...")
+        _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+        
+        edges = cv2.Canny(binary, 50, 150, apertureSize=3)
+        lines = cv2.HoughLinesP(edges, 1, np.pi/180, threshold=30, minLineLength=20, maxLineGap=5)
+        
+        line_mask = np.zeros_like(binary)
+        if lines is not None:
+            for line in lines:
+                x1, y1, x2, y2 = line[0]
+                cv2.line(line_mask, (x1, y1), (x2, y2), 255, 3)
+        
+        result = cv2.subtract(binary, line_mask)
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2))
+        result = cv2.morphologyEx(result, cv2.MORPH_CLOSE, kernel)
+        result = cv2.bitwise_not(result)
+        
+        cv2.imwrite("debug_method0_hough.png", result)
+        text = pytesseract.image_to_string(result, lang='eng', config=custom_config).strip()
+        score = self._validate_and_score_result(text) if text else -1
+        logger.info(f"  Method 0: '{text}' (score: {score})")
+        return text, score
     
     def _send_extraction_log(self, original_filename, page_number, method_results, 
                             direct_text="", direct_score=None, final_answer="", 

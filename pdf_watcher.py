@@ -14,6 +14,13 @@ from configparser import ConfigParser
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
 
+# Import both extractor versions
+try:
+    from pdf_extractorV2 import PDFTextExtractor as PDFTextExtractorV2
+    EXTRACTOR_V2_AVAILABLE = True
+except ImportError:
+    EXTRACTOR_V2_AVAILABLE = False
+    
 from pdf_extractor import PDFTextExtractor
 
 
@@ -265,8 +272,20 @@ def main():
     watch_folder = config.get('Settings', 'watch_folder')
     logger.info(f"Watching folder: {watch_folder}")
     
-    # Initialize text extractor
-    extractor = PDFTextExtractor(config)
+    # Select extractor version based on configuration
+    use_extractor_v2 = config.getboolean('Settings', 'use_extractor_v2', fallback=False)
+    
+    if use_extractor_v2:
+        if EXTRACTOR_V2_AVAILABLE:
+            logger.info("[V2] Using PDFTextExtractorV2 (optimized with parallel processing)")
+            extractor = PDFTextExtractorV2(config)
+        else:
+            logger.warning("PDFTextExtractorV2 not available, falling back to standard extractor")
+            logger.info("[V1] Using PDFTextExtractor (standard version)")
+            extractor = PDFTextExtractor(config)
+    else:
+        logger.info("[V1] Using PDFTextExtractor (standard version)")
+        extractor = PDFTextExtractor(config)
     
     # Initialize file handler
     event_handler = PDFFileHandler(config, extractor)
