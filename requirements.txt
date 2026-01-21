@@ -1,0 +1,23 @@
+# PDF Folder Watcher - Requirements
+# Python 3.7+
+
+# File system monitoring
+watchdog==3.0.0
+
+# PDF processing
+PyMuPDF==1.23.8
+
+# Image processing for OCR
+Pillow==10.1.0
+
+# OCR engine
+pytesseract==0.3.10
+
+# Image processing with OpenCV
+opencv-python==4.8.1.78
+
+# Numpy for image processing
+numpy==1.24.3
+
+# HTTP requests for API logging
+requests==2.31.0
