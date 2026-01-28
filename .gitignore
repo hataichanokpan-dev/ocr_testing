@@ -27,6 +27,18 @@ wheels/
 debug_*.png
 debug_*.jpg
 
+# Temporary files
+*.tmp
+*.temp
+*.bak
+*.old
+*.orig
+
+# Data files
+test_*.pdf
+output_*.pdf
+example_*.pdf
+
 # Log files
 *.log
 
