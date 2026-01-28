@@ -50,21 +50,6 @@ class PDFTextExtractor:
         self.expected_digit_count = config.getint('Settings', 'expected_digit_count', fallback=8)
         self.min_digit_count = config.getint('Settings', 'min_digit_count', fallback=6)
         
-        # Pattern-based validation (more precise)
-        # Format: [Prefix:1]-[Country/Region:1-2]-[Code/Type:2-4]-[Serial/ID:7-10]
-        self.enable_pattern_validation = config.getboolean('Settings', 'enable_pattern_validation', fallback=True)
-        self.pattern_prefix_length = config.getint('Settings', 'pattern_prefix_length', fallback=1)
-        self.pattern_country_min = config.getint('Settings', 'pattern_country_min', fallback=1)
-        self.pattern_country_max = config.getint('Settings', 'pattern_country_max', fallback=2)
-        self.pattern_code_min = config.getint('Settings', 'pattern_code_min', fallback=2)
-        self.pattern_code_max = config.getint('Settings', 'pattern_code_max', fallback=4)
-        self.pattern_serial_min = config.getint('Settings', 'pattern_serial_min', fallback=7)
-        self.pattern_serial_max = config.getint('Settings', 'pattern_serial_max', fallback=10)
-        
-        # Serial/ID strict validation (first char must be from allowed list, rest must be digits)
-        allowed_prefixes_str = config.get('Settings', 'pattern_serial_allowed_prefixes', fallback='')
-        self.pattern_serial_allowed_prefixes = [p.strip().upper() for p in allowed_prefixes_str.split(',') if p.strip()]
-        
         # API logging configuration
         self.api_url = config.get('Settings', 'api_log_url', 
                                   fallback='http://mth-vm-pdw/pdw-picklist-api/api/PDW/AddExtractionLog')
@@ -98,7 +83,7 @@ class PDFTextExtractor:
             
             logger.info(f"PDF has {len(doc)} pages. Will read pages: {self.pages_to_read}")
             
-            all_results = []  # Store tuples of (text, score, page_num, frequency)
+            all_texts = []
             
             # Process each specified page
             for page_num in self.pages_to_read:
@@ -134,11 +119,11 @@ class PDFTextExtractor:
                 
                 if direct_text:
                     logger.info(f"Page {page_num}: Extracted text directly: {direct_text}")
-                    direct_score = self._validate_and_score_result(direct_text)
-                    all_results.append((direct_text, direct_score, page_num, 1.0))
+                    all_texts.append(direct_text)
                     
                     # Log successful direct extraction to API
                     if self.enable_api_logging:
+                        direct_score = self._validate_and_score_result(direct_text)
                         self._send_extraction_log(
                             original_filename=original_filename,
                             page_number=page_num,
@@ -152,18 +137,16 @@ class PDFTextExtractor:
                 else:
                     # If no text found, use OCR
                     logger.info(f"Page {page_num}: No text found, attempting OCR...")
-                    text, method_results, freq_ratio = self._ocr_extract_with_confidence(
-                        page, header_rect, page_num, original_filename, direct_text
-                    )
+                    text = self._ocr_extract(page, header_rect, page_num, original_filename, direct_text)
                     if text:
-                        score = self._validate_and_score_result(text)
-                        all_results.append((text, score, page_num, freq_ratio))
+                        all_texts.append(text)
             
             doc.close()
             
-            # Combine and analyze results from all pages
-            if all_results:
-                final_text = self._select_best_result_from_pages(all_results)
+            # Combine texts from all pages
+            if all_texts:
+                # If multiple results, pick the longest one (most complete)
+                final_text = max(all_texts, key=len)
                 logger.info(f"Final extracted text: {final_text}")
                 return final_text
             
@@ -173,9 +156,9 @@ class PDFTextExtractor:
             logger.error(f"Error extracting text from {pdf_path}: {e}")
             return ""
     
-    def _ocr_extract_with_confidence(self, page, rect, page_num=1, original_filename="", direct_text=""):
+    def _ocr_extract(self, page, rect, page_num=1, original_filename="", direct_text=""):
         """
-        Use OCR to extract text from a specific area with confidence metrics
+        Use OCR to extract text from a specific area
         
         Args:
             page: PyMuPDF page object
@@ -185,7 +168,7 @@ class PDFTextExtractor:
             direct_text: Text extracted directly from PDF (if any)
             
         Returns:
-            tuple: (text, method_results, frequency_ratio)
+            str: Extracted text via OCR
         """
         try:
             # Render the area as image at very high resolution (6x for better OCR)
@@ -201,7 +184,7 @@ class PDFTextExtractor:
             logger.info(f"Debug: Saved extracted area to {debug_path}")
             
             # Try multiple preprocessing methods and get detailed results
-            text, method_results, freq_ratio = self._try_multiple_ocr_methods(img)
+            text, method_results = self._try_multiple_ocr_methods(img)
             
             # Log to API
             if self.enable_api_logging:
@@ -220,7 +203,7 @@ class PDFTextExtractor:
             else:
                 logger.warning("OCR could not extract any text")
             
-            return text, method_results, freq_ratio
+            return text
             
         except Exception as e:
             logger.error(f"OCR extraction failed: {e}", exc_info=True)
@@ -238,7 +221,7 @@ class PDFTextExtractor:
                     error_message=str(e)
                 )
             
-            return "", {}, 0.0
+            return ""
     
     def _validate_and_score_result(self, text):
         """
@@ -255,11 +238,6 @@ class PDFTextExtractor:
         
         score = 0
         
-        # Use pattern-based validation if enabled
-        if self.enable_pattern_validation:
-            return self._validate_with_pattern(text)
-        
-        # Fallback to legacy validation
         # Split by configured separator
         parts = text.split(self.expected_separator)
         
@@ -305,210 +283,6 @@ class PDFTextExtractor:
         logger.info(f"  Score: {score} for '{text}'")
         return score
     
-    def _validate_with_pattern(self, text):
-        """
-        Validate text using detailed pattern rules
-        Format: [Prefix:1]-[Country/Region:1-2]-[Code/Type:2-4]-[Serial/ID:7-10]
-        Example: B-C-5U5-R4091534
-        
-        Args:
-            text: Text to validate
-            
-        Returns:
-            int: Score (higher is better), -1 if invalid
-        """
-        score = 0
-        
-        # Split by separator
-        parts = text.split(self.expected_separator)
-        
-        # Must have exactly 4 parts
-        if len(parts) != self.expected_parts:
-            logger.info(f"  [PATTERN] Invalid part count: {len(parts)} (expected {self.expected_parts})")
-            return -1
-        
-        score += 60  # Base score for correct structure
-        
-        # Validate Part 1: Prefix (1 letter)
-        prefix = parts[0]
-        if len(prefix) == self.pattern_prefix_length and prefix.isalpha():
-            score += 30
-            logger.info(f"  [PATTERN] ✓ Prefix '{prefix}' valid (1 letter)")
-        else:
-            score -= 20
-            logger.info(f"  [PATTERN] ✗ Prefix '{prefix}' invalid (expected 1 letter)")
-        
-        # Validate Part 2: Country/Region (1-2 letters)
-        country = parts[1]
-        if (self.pattern_country_min <= len(country) <= self.pattern_country_max and 
-            country.isalpha()):
-            score += 30
-            logger.info(f"  [PATTERN] ✓ Country '{country}' valid ({len(country)} letter(s))")
-        else:
-            score -= 20
-            logger.info(f"  [PATTERN] ✗ Country '{country}' invalid (expected 1-2 letters)")
-        
-        # Validate Part 3: Code/Type (2-4 alphanumeric)
-        code = parts[2]
-        if (self.pattern_code_min <= len(code) <= self.pattern_code_max and 
-            code.isalnum()):
-            score += 30
-            logger.info(f"  [PATTERN] ✓ Code '{code}' valid ({len(code)} char(s))")
-        else:
-            score -= 20
-            logger.info(f"  [PATTERN] ✗ Code '{code}' invalid (expected 2-4 alphanumeric)")
-        
-        # Validate Part 4: Serial/ID (7-10 alphanumeric)
-        serial = parts[3].strip()  # Remove trailing spaces
-        serial_clean = ''.join(c for c in serial if c.isalnum())  # Remove noise
-        
-        if self.pattern_serial_min <= len(serial_clean) <= self.pattern_serial_max:
-            score += 40
-            
-            # Strict validation if allowed prefixes are specified
-            if self.pattern_serial_allowed_prefixes:
-                # Check format: first char must be from allowed list, rest must be digits
-                if len(serial_clean) > 0:
-                    first_char = serial_clean[0].upper()
-                    rest_chars = serial_clean[1:]
-                    
-                    # Validate first character
-                    if first_char in self.pattern_serial_allowed_prefixes:
-                        score += 30
-                        logger.info(f"  [PATTERN] ✓ Serial prefix '{first_char}' valid (allowed: {', '.join(self.pattern_serial_allowed_prefixes)})")
-                        
-                        # Validate rest are digits
-                        if rest_chars.isdigit():
-                            digit_count = len(rest_chars)
-                            score += 50
-                            logger.info(f"  [PATTERN] ★ PERFECT Serial format ({first_char} + {digit_count} digits)")
-                            
-                            # Bonus for ideal length (8-9 total = 1 letter + 7-8 digits)
-                            if len(serial_clean) in [8, 9]:
-                                score += 20
-                                logger.info(f"  [PATTERN] ★ Ideal length: {len(serial_clean)} chars")
-                        else:
-                            score -= 40
-                            non_digit_count = sum(1 for c in rest_chars if not c.isdigit())
-                            logger.info(f"  [PATTERN] ✗ Serial has non-digit chars after prefix: {non_digit_count} invalid char(s)")
-                    else:
-                        score -= 40
-                        logger.info(f"  [PATTERN] ✗ Serial prefix '{first_char}' invalid (allowed: {', '.join(self.pattern_serial_allowed_prefixes)})")
-            else:
-                # Legacy validation (no strict prefix requirement)
-                letter_count = sum(c.isalpha() for c in serial_clean)
-                digit_count = sum(c.isdigit() for c in serial_clean)
-                
-                logger.info(f"  [PATTERN] ✓ Serial '{serial_clean}' valid ({len(serial_clean)} chars: {letter_count} letter(s), {digit_count} digit(s))")
-                
-                # Bonus for ideal format: 1 letter + 7-8 digits
-                if letter_count == 1 and 7 <= digit_count <= 8:
-                    score += 50
-                    logger.info(f"  [PATTERN] ★ PERFECT Serial format (1 letter + {digit_count} digits)")
-                # Good format: mostly digits
-                elif digit_count >= 7:
-                    score += 30
-                    logger.info(f"  [PATTERN] ✓ Good Serial format ({digit_count} digits)")
-                # Acceptable format
-                elif digit_count >= 6:
-                    score += 10
-                else:
-                    score -= 10
-                    logger.info(f"  [PATTERN] ⚠ Serial has few digits ({digit_count})")
-            
-            # Penalize trailing noise (space + single char)
-            if serial != serial_clean:
-                noise_chars = len(serial) - len(serial_clean)
-                penalty = noise_chars * 15
-                score -= penalty
-                logger.info(f"  [PATTERN] ⚠ Trailing noise detected: '{serial}' (penalty: -{penalty})")
-        else:
-            score -= 30
-            logger.info(f"  [PATTERN] ✗ Serial '{serial_clean}' invalid length: {len(serial_clean)} (expected {self.pattern_serial_min}-{self.pattern_serial_max})")
-        
-        # Final score adjustment
-        score = max(score, -1)  # Minimum score is -1 (invalid)
-        
-        logger.info(f"  [PATTERN] Total score: {score} for '{text}'")
-        return score
-    
-    def _select_best_result_from_pages(self, all_results):
-        """
-        Select the best result from multiple pages using combined scoring
-        
-        Args:
-            all_results: List of tuples (text, score, page_num, frequency_ratio)
-            
-        Returns:
-            str: Best extracted text across all pages
-        """
-        logger.info(f"\n[MULTI-PAGE ANALYSIS] Analyzing results from {len(all_results)} page(s)...")
-        
-        # Aggregate results by text
-        from collections import defaultdict
-        aggregated = defaultdict(lambda: {'pages': [], 'scores': [], 'freq_ratios': []})
-        
-        for text, score, page_num, freq_ratio in all_results:
-            aggregated[text]['pages'].append(page_num)
-            aggregated[text]['scores'].append(score)
-            aggregated[text]['freq_ratios'].append(freq_ratio)
-        
-        # Score each unique result
-        final_scores = []
-        for text, data in aggregated.items():
-            # Calculate combined score
-            avg_score = sum(data['scores']) / len(data['scores'])
-            max_score = max(data['scores'])
-            avg_freq_ratio = sum(data['freq_ratios']) / len(data['freq_ratios'])
-            page_count = len(data['pages'])
-            
-            # Combined scoring:
-            # - Average score (weight: 0.4)
-            # - Max score (weight: 0.2)
-            # - Average frequency ratio (weight: 0.3)
-            # - Page count bonus (weight: 0.1)
-            combined_score = (
-                avg_score * 0.4 +
-                max_score * 0.2 +
-                avg_freq_ratio * 100 * 0.3 +  # Convert ratio to score range
-                page_count * 10 * 0.1
-            )
-            
-            # Additional penalty for trailing space + single char (likely OCR noise)
-            if len(text) > 2 and text[-2] == ' ' and (text[-1].isalpha() or text[-1].isdigit()):
-                combined_score -= 30
-                logger.info(f"  [PENALTY] Trailing char detected in '{text}', -30 score")
-            
-            final_scores.append({
-                'text': text,
-                'combined_score': combined_score,
-                'avg_score': avg_score,
-                'max_score': max_score,
-                'avg_freq_ratio': avg_freq_ratio,
-                'page_count': page_count,
-                'pages': data['pages']
-            })
-        
-        # Sort by combined score (descending)
-        final_scores.sort(key=lambda x: x['combined_score'], reverse=True)
-        
-        # Log analysis
-        logger.info("\n[RESULT COMPARISON]")
-        for i, result in enumerate(final_scores, 1):
-            logger.info(
-                f"  {i}. '{result['text']}' "
-                f"(combined: {result['combined_score']:.1f}, "
-                f"avg_score: {result['avg_score']:.1f}, "
-                f"freq: {result['avg_freq_ratio']:.2f}, "
-                f"pages: {result['page_count']}, "
-                f"from: {result['pages']})"
-            )
-        
-        best_result = final_scores[0]['text']
-        logger.info(f"\n[FINAL DECISION] Selected: '{best_result}' (combined score: {final_scores[0]['combined_score']:.1f})")
-        
-        return best_result
-    
     def _try_multiple_ocr_methods(self, img):
         """
         Try multiple preprocessing methods to extract text
@@ -518,10 +292,9 @@ class PDFTextExtractor:
             img: PIL Image object
             
         Returns:
-            tuple: (best_text, method_results_dict, frequency_ratio)
+            tuple: (best_text, method_results_dict)
                 - best_text: Best extracted text
                 - method_results_dict: Dictionary with all method results and scores
-                - frequency_ratio: Ratio of methods that agreed on best result (0.0-1.0)
         """
         results = []
         method_results = {}
@@ -617,7 +390,6 @@ class PDFTextExtractor:
                 best_result = scored_results[0][2]
                 best_score = scored_results[0][0]
                 best_freq = scored_results[0][1]
-                freq_ratio = best_freq / len(results)
                 
                 logger.info(f"\n[BEST] Best result: '{best_result}' (score: {best_score}, frequency: {best_freq}/{len(results)})")
                 
@@ -627,10 +399,10 @@ class PDFTextExtractor:
                     for i, (score, freq, text) in enumerate(scored_results[1:4], 2):
                         logger.info(f"  {i}. '{text}' (score: {score}, freq: {freq})")
                 
-                return best_result, method_results, freq_ratio
+                return best_result, method_results
         
         logger.warning("[FAIL] No valid results from any method")
-        return "", method_results, 0.0
+        return "", method_results
     
     # ========== OCR Method Implementations ==========
     
