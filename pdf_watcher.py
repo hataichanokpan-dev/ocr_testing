@@ -74,7 +74,7 @@ class PDFFileHandler(FileSystemEventHandler):
     
     def process_pdf(self, file_path):
         """
-        Process a PDF file: extract text and rename
+        Process a PDF file: extract text and rename, or split if enabled
         
         Args:
             file_path: Path to the PDF file
@@ -92,54 +92,93 @@ class PDFFileHandler(FileSystemEventHandler):
                 logger.warning(f"File not ready or inaccessible: {file_path}")
                 return
             
-            # Extract header text
-            header_text = self.extractor.extract_header_text(file_path)
+            # Check if PDF splitting is enabled
+            enable_splitting = self.config.getboolean('Settings', 'enable_pdf_splitting', fallback=False)
             
-            # Get original filename without extension as fallback
-            original_name = Path(file_path).stem
-            
-            if not header_text:
-                logger.warning(f"No text extracted from: {file_path}, keeping original name")
-            
-            # Sanitize filename (will use original name if header_text is empty)
-            new_name = self.extractor.sanitize_filename(header_text, original_filename=original_name)
-            
-            # Add timestamp if configured
-            if self.add_timestamp:
-                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                new_name = f"{new_name}_{timestamp}"
-            
-            # Add extension
-            new_name = f"{new_name}{self.file_extension}"
-            
-            # Determine output path
-            if self.output_folder and os.path.exists(self.output_folder):
-                output_path = os.path.join(self.output_folder, new_name)
+            if enable_splitting:
+                # ========== PDF SPLITTING MODE ==========
+                logger.info(f"[SPLIT MODE] Processing with PDF splitting enabled")
+                
+                split_results = self.extractor.split_pdf_by_header(file_path, self.output_folder)
+                
+                if split_results:
+                    # Mark all split files as processed
+                    for output_path, header_text, page_range in split_results:
+                        self.processed_files.add(output_path)
+                    
+                    logger.info(f"[SPLIT MODE] Created {len(split_results)} split file(s)")
+                    
+                    # Delete original if configured
+                    delete_after_split = self.config.getboolean('Settings', 'delete_original_after_split', fallback=False)
+                    if delete_after_split:
+                        try:
+                            os.remove(file_path)
+                            logger.info(f"[SPLIT MODE] Deleted original file: {file_path}")
+                        except Exception as e:
+                            logger.error(f"[SPLIT MODE] Failed to delete original file: {e}")
+                else:
+                    logger.warning(f"[SPLIT MODE] No splits created, falling back to standard rename")
+                    # Fall back to standard processing
+                    self._process_standard_rename(file_path)
             else:
-                output_dir = os.path.dirname(file_path)
-                output_path = os.path.join(output_dir, new_name)
-            
-            # Handle duplicate filenames
-            output_path = self._get_unique_filename(output_path)
-            
-            # Mark output file as processed to avoid re-processing
-            self.processed_files.add(output_path)
-            
-            # Copy or move the file
-            if self.delete_original:
-                shutil.move(file_path, output_path)
-                logger.info(f"Moved and renamed: {file_path} -> {output_path}")
-            else:
-                shutil.copy2(file_path, output_path)
-                logger.info(f"Copied and renamed: {file_path} -> {output_path}")
-            
-            logger.info(f"Successfully processed: {new_name}")
+                # ========== STANDARD RENAME MODE ==========
+                self._process_standard_rename(file_path)
             
         except Exception as e:
             logger.error(f"Error processing {file_path}: {e}", exc_info=True)
         finally:
             if file_path in self.processing:
                 self.processing.remove(file_path)
+    
+    def _process_standard_rename(self, file_path):
+        """
+        Standard processing: extract header and rename single file
+        
+        Args:
+            file_path: Path to the PDF file
+        """
+        # Extract header text
+        header_text = self.extractor.extract_header_text(file_path)
+        
+        # Get original filename without extension as fallback
+        original_name = Path(file_path).stem
+        
+        if not header_text:
+            logger.warning(f"No text extracted from: {file_path}, keeping original name")
+        
+        # Sanitize filename (will use original name if header_text is empty)
+        new_name = self.extractor.sanitize_filename(header_text, original_filename=original_name)
+        
+        # Add timestamp if configured
+        if self.add_timestamp:
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            new_name = f"{new_name}_{timestamp}"
+        
+        # Add extension
+        new_name = f"{new_name}{self.file_extension}"
+        
+        # Determine output path
+        if self.output_folder and os.path.exists(self.output_folder):
+            output_path = os.path.join(self.output_folder, new_name)
+        else:
+            output_dir = os.path.dirname(file_path)
+            output_path = os.path.join(output_dir, new_name)
+        
+        # Handle duplicate filenames
+        output_path = self._get_unique_filename(output_path)
+        
+        # Mark output file as processed to avoid re-processing
+        self.processed_files.add(output_path)
+        
+        # Copy or move the file
+        if self.delete_original:
+            shutil.move(file_path, output_path)
+            logger.info(f"Moved and renamed: {file_path} -> {output_path}")
+        else:
+            shutil.copy2(file_path, output_path)
+            logger.info(f"Copied and renamed: {file_path} -> {output_path}")
+        
+        logger.info(f"Successfully processed: {new_name}")
     
     def _wait_for_file_ready(self, file_path, timeout=30):
         """

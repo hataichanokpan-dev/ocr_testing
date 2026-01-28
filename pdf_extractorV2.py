@@ -1091,3 +1091,331 @@ class PDFTextExtractor:
             return "unnamed"
         
         return text
+    
+    def split_pdf_by_header(self, pdf_path, output_folder=None):
+        """
+        Split PDF into multiple files based on header text changes
+        
+        Args:
+            pdf_path: Path to input PDF file
+            output_folder: Folder to save split PDFs (uses config if None)
+            
+        Returns:
+            list: List of tuples [(output_path, header_text, page_range), ...]
+                  Empty list if splitting fails or is disabled
+        """
+        try:
+            logger.info(f"\n{'='*60}")
+            logger.info(f"[PDF SPLITTING] Starting split process for: {pdf_path}")
+            logger.info(f"{'='*60}")
+            
+            # Open PDF
+            doc = fitz.open(pdf_path)
+            total_pages = len(doc)
+            
+            if total_pages == 0:
+                logger.warning("[PDF SPLITTING] PDF has no pages")
+                doc.close()
+                return []
+            
+            logger.info(f"[PDF SPLITTING] Total pages: {total_pages}")
+            
+            # Detect header changes across all pages
+            split_groups = self._detect_header_changes(doc, pdf_path)
+            
+            if not split_groups:
+                logger.warning("[PDF SPLITTING] No valid header groups detected")
+                doc.close()
+                return []
+            
+            logger.info(f"[PDF SPLITTING] Detected {len(split_groups)} groups")
+            
+            # Determine output folder
+            if output_folder is None:
+                split_folder = self.config.get('Settings', 'split_output_folder', fallback='')
+                if not split_folder:
+                    split_folder = self.config.get('Settings', 'output_folder', fallback='')
+                if not split_folder:
+                    split_folder = str(Path(pdf_path).parent)
+                output_folder = split_folder
+            
+            # Create output folder if needed
+            Path(output_folder).mkdir(parents=True, exist_ok=True)
+            
+            # Get original filename for naming pattern
+            original_filename = Path(pdf_path).stem
+            
+            # Create split PDFs
+            split_results = []
+            naming_pattern = self.config.get('Settings', 'split_naming_pattern', 
+                                            fallback='{header}_pages_{start}-{end}')
+            
+            for idx, (start_page, end_page, header_text) in enumerate(split_groups, 1):
+                # Generate filename using pattern
+                sanitized_header = self.sanitize_filename(header_text, original_filename=f"section_{idx}")
+                
+                # Replace placeholders in naming pattern
+                filename = naming_pattern.format(
+                    header=sanitized_header,
+                    start=start_page + 1,  # Convert to 1-based for user display
+                    end=end_page + 1,
+                    index=idx,
+                    original=original_filename
+                )
+                
+                # Sanitize the final filename
+                filename = self.sanitize_filename(filename, original_filename=f"{original_filename}_split_{idx}")
+                filename = f"{filename}.pdf"
+                
+                output_path = os.path.join(output_folder, filename)
+                
+                # Handle duplicate filenames
+                output_path = self._get_unique_split_filename(output_path)
+                
+                # Create the split PDF
+                success = self._create_split_pdf(doc, start_page, end_page, output_path)
+                
+                if success:
+                    page_range = f"{start_page + 1}-{end_page + 1}"
+                    split_results.append((output_path, header_text, page_range))
+                    logger.info(f"[PDF SPLITTING] ✓ Created: {Path(output_path).name} (pages {page_range}, header: '{header_text}')")
+                else:
+                    logger.error(f"[PDF SPLITTING] ✗ Failed to create split {idx}")
+            
+            doc.close()
+            
+            logger.info(f"\n[PDF SPLITTING] Successfully created {len(split_results)} split PDF(s)")
+            logger.info(f"{'='*60}\n")
+            
+            # Send split summary to API
+            if self.enable_api_logging and split_results:
+                self._send_split_log(pdf_path, split_results)
+            
+            return split_results
+            
+        except Exception as e:
+            logger.error(f"[PDF SPLITTING] Error splitting PDF {pdf_path}: {e}", exc_info=True)
+            return []
+    
+    def _detect_header_changes(self, doc, pdf_path):
+        """
+        Detect page breaks based on header text changes
+        
+        Args:
+            doc: PyMuPDF document object
+            pdf_path: Path to PDF file (for logging)
+            
+        Returns:
+            list: List of tuples [(start_page, end_page, header_text), ...]
+                  Pages are 0-based indices
+        """
+        try:
+            logger.info("[HEADER DETECTION] Scanning all pages for headers...")
+            
+            total_pages = len(doc)
+            min_pages = self.config.getint('Settings', 'min_pages_per_split', fallback=1)
+            similarity_threshold = self.config.getfloat('Settings', 'header_similarity_threshold', fallback=1.0)
+            
+            # Extract header from each page
+            page_headers = []
+            for page_num in range(total_pages):
+                page = doc[page_num]
+                page_rect = page.rect
+                
+                # Calculate header area (same as extract_header_text)
+                if self.header_width <= 100 and self.header_height <= 100:
+                    x0 = page_rect.width * (self.header_left / 100)
+                    y0 = page_rect.height * (self.header_top / 100)
+                    x1 = page_rect.width * ((self.header_left + self.header_width) / 100)
+                    y1 = page_rect.height * ((self.header_top + self.header_height) / 100)
+                else:
+                    x0, y0 = self.header_left, self.header_top
+                    x1 = x0 + self.header_width
+                    y1 = y0 + self.header_height
+                
+                header_rect = fitz.Rect(x0, y0, x1, y1)
+                
+                # Try direct text extraction first
+                header_text = page.get_text("text", clip=header_rect).strip()
+                
+                # If no text, use OCR
+                if not header_text:
+                    original_filename = Path(pdf_path).stem
+                    header_text, _, _ = self._ocr_extract_with_confidence(
+                        page, header_rect, page_num + 1, original_filename, ""
+                    )
+                
+                page_headers.append((page_num, header_text))
+                logger.info(f"  Page {page_num + 1}: '{header_text}'")
+            
+            # Group consecutive pages with same/similar headers
+            groups = []
+            current_start = 0
+            current_header = page_headers[0][1]
+            
+            for i in range(1, len(page_headers)):
+                page_num, header = page_headers[i]
+                
+                # Check if header changed
+                if not self._headers_match(current_header, header, similarity_threshold):
+                    # Save current group
+                    if current_header:  # Only save if header is not empty
+                        groups.append((current_start, i - 1, current_header))
+                        logger.info(f"[GROUP] Pages {current_start + 1}-{i}: '{current_header}'")
+                    
+                    # Start new group
+                    current_start = i
+                    current_header = header
+            
+            # Add last group
+            if current_header:
+                groups.append((current_start, len(page_headers) - 1, current_header))
+                logger.info(f"[GROUP] Pages {current_start + 1}-{len(page_headers)}: '{current_header}'")
+            
+            # Filter out groups smaller than min_pages (if configured)
+            if min_pages > 1:
+                original_count = len(groups)
+                groups = [(s, e, h) for s, e, h in groups if (e - s + 1) >= min_pages]
+                if len(groups) < original_count:
+                    logger.info(f"[FILTER] Removed {original_count - len(groups)} group(s) with < {min_pages} pages")
+            
+            logger.info(f"[HEADER DETECTION] Found {len(groups)} group(s)")
+            return groups
+            
+        except Exception as e:
+            logger.error(f"[HEADER DETECTION] Error detecting header changes: {e}", exc_info=True)
+            return []
+    
+    def _headers_match(self, header1, header2, threshold=1.0):
+        """
+        Check if two headers match based on similarity threshold
+        
+        Args:
+            header1: First header text
+            header2: Second header text
+            threshold: Similarity threshold (0.0-1.0)
+            
+        Returns:
+            bool: True if headers match, False otherwise
+        """
+        if not header1 or not header2:
+            return header1 == header2
+        
+        # Exact match
+        if header1 == header2:
+            return True
+        
+        # If threshold is 1.0, only exact match allowed
+        if threshold >= 1.0:
+            return False
+        
+        # Calculate similarity ratio
+        from difflib import SequenceMatcher
+        ratio = SequenceMatcher(None, header1, header2).ratio()
+        
+        return ratio >= threshold
+    
+    def _create_split_pdf(self, source_doc, start_page, end_page, output_path):
+        """
+        Create new PDF from page range using PyMuPDF
+        
+        Args:
+            source_doc: Source PyMuPDF document
+            start_page: Start page (0-based, inclusive)
+            end_page: End page (0-based, inclusive)
+            output_path: Path to save new PDF
+            
+        Returns:
+            bool: True if successful, False otherwise
+        """
+        try:
+            # Create new PDF
+            new_doc = fitz.open()
+            
+            # Insert pages from source
+            new_doc.insert_pdf(source_doc, from_page=start_page, to_page=end_page)
+            
+            # Save the new PDF
+            new_doc.save(output_path)
+            new_doc.close()
+            
+            return True
+            
+        except Exception as e:
+            logger.error(f"[PDF CREATION] Error creating split PDF: {e}", exc_info=True)
+            return False
+    
+    def _get_unique_split_filename(self, file_path):
+        """
+        Generate unique filename for split PDF if file already exists
+        
+        Args:
+            file_path: Desired file path
+            
+        Returns:
+            str: Unique file path
+        """
+        if not os.path.exists(file_path):
+            return file_path
+        
+        base_path = Path(file_path)
+        base_name = base_path.stem
+        extension = base_path.suffix
+        directory = base_path.parent
+        
+        counter = 1
+        while True:
+            new_path = directory / f"{base_name}_{counter}{extension}"
+            if not os.path.exists(new_path):
+                return str(new_path)
+            counter += 1
+    
+    def _send_split_log(self, original_pdf_path, split_results):
+        """
+        Send split operation summary to API
+        
+        Args:
+            original_pdf_path: Path to original PDF
+            split_results: List of (output_path, header_text, page_range) tuples
+        """
+        try:
+            # Prepare split summary
+            splits_info = []
+            for output_path, header_text, page_range in split_results:
+                splits_info.append({
+                    'filename': Path(output_path).name,
+                    'header': header_text,
+                    'pages': page_range
+                })
+            
+            payload = {
+                "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "original_filename": Path(original_pdf_path).name,
+                "operation": "pdf_split",
+                "split_count": len(split_results),
+                "splits": json.dumps(splits_info),
+                "status": "success"
+            }
+            
+            # Note: Using same API endpoint, but with different operation type
+            # The API should handle this appropriately or you may need a different endpoint
+            logger.info(f"[API LOG] Sending split summary to API...")
+            logger.debug(f"[API LOG] Payload: {json.dumps(payload, indent=2)}")
+            
+            response = requests.post(
+                self.api_url,
+                json=payload,
+                headers={
+                    'accept': '*/*',
+                    'Content-Type': 'application/json'
+                },
+                timeout=10
+            )
+            
+            if response.status_code == 200:
+                logger.info(f"[API LOG] Split summary logged successfully")
+            else:
+                logger.warning(f"[API LOG] API returned status {response.status_code}")
+                
+        except Exception as e:
+            logger.error(f"[API LOG] Failed to send split log: {e}")
