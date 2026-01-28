@@ -74,8 +74,88 @@ class PDFTextExtractor:
         self.enable_parallel_processing = config.getboolean('Settings', 'enable_parallel_processing', fallback=True)
         self.max_workers = config.getint('Settings', 'max_workers', fallback=4)
         
+        # OCR optimization settings
+        self.ocr_filter_black_text = config.getboolean('Settings', 'ocr_filter_black_text', fallback=True)
+        self.ocr_black_threshold = config.getint('Settings', 'ocr_black_threshold', fallback=100)
+        
+        # Debug image settings
+        self.save_debug_images = config.getboolean('Settings', 'save_debug_images', fallback=True)
+        self.debug_images_folder = config.get('Settings', 'debug_images_folder', fallback='debug_images')
+        self.organize_by_date = config.getboolean('Settings', 'organize_by_date', fallback=True)
+        self.save_method_images = config.getboolean('Settings', 'save_method_images', fallback=True)
+        self.image_retention_days = config.getint('Settings', 'image_retention_days', fallback=30)
+        
+        # Create debug folder if needed
+        if self.save_debug_images:
+            self._setup_debug_folder()
+        
         # Method execution order (best performing methods first for better user feedback)
         self.method_priority = ['method2', 'method3', 'method4', 'method5', 'method1', 'method6', 'method0B', 'method0C', 'method7', 'method0']
+    
+    def _setup_debug_folder(self):
+        """Create debug folder structure and clean old images"""
+        try:
+            base_folder = Path(self.debug_images_folder)
+            base_folder.mkdir(exist_ok=True)
+            logger.info(f"Debug images folder: {base_folder.absolute()}")
+            
+            # Clean old images if retention policy is set
+            if self.image_retention_days > 0:
+                self._cleanup_old_images(base_folder)
+        except Exception as e:
+            logger.error(f"Failed to setup debug folder: {e}")
+    
+    def _cleanup_old_images(self, base_folder):
+        """Delete images older than retention days"""
+        try:
+            from datetime import timedelta
+            cutoff_date = datetime.now() - timedelta(days=self.image_retention_days)
+            deleted_count = 0
+            
+            # Iterate through all files and subfolders
+            for file_path in base_folder.rglob('*.png'):
+                if file_path.is_file():
+                    file_time = datetime.fromtimestamp(file_path.stat().st_mtime)
+                    if file_time < cutoff_date:
+                        file_path.unlink()
+                        deleted_count += 1
+            
+            if deleted_count > 0:
+                logger.info(f"Cleaned up {deleted_count} old debug images (older than {self.image_retention_days} days)")
+        except Exception as e:
+            logger.error(f"Failed to cleanup old images: {e}")
+    
+    def _get_debug_path(self, original_filename, page_num, method_name=""):
+        """Generate debug image path with proper organization"""
+        if not self.save_debug_images:
+            return None
+        
+        try:
+            base_folder = Path(self.debug_images_folder)
+            
+            # Organize by date if enabled
+            if self.organize_by_date:
+                date_folder = base_folder / datetime.now().strftime("%Y-%m-%d")
+                date_folder.mkdir(parents=True, exist_ok=True)
+                save_folder = date_folder
+            else:
+                save_folder = base_folder
+            
+            # Create filename with timestamp
+            timestamp = datetime.now().strftime("%H%M%S")
+            filename_base = Path(original_filename).stem if original_filename else "unknown"
+            
+            if method_name:
+                # Method-specific image (e.g., method2_threshold)
+                filename = f"{filename_base}_page{page_num}_{timestamp}_{method_name}.png"
+            else:
+                # Original extracted area
+                filename = f"{filename_base}_page{page_num}_{timestamp}_original.png"
+            
+            return str(save_folder / filename)
+        except Exception as e:
+            logger.error(f"Failed to generate debug path: {e}")
+            return f"debug_page{page_num}.png"  # Fallback
         
     def extract_header_text(self, pdf_path):
         """
@@ -196,12 +276,15 @@ class PDFTextExtractor:
             img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
             
             # Save debug image to see what's being extracted
-            debug_path = f"debug_page{page_num}_extracted_area.png"
-            img.save(debug_path)
-            logger.info(f"Debug: Saved extracted area to {debug_path}")
+            debug_path = self._get_debug_path(original_filename, page_num)
+            if debug_path:
+                img.save(debug_path)
+                logger.info(f"Debug: Saved extracted area to {debug_path}")
+            else:
+                debug_path = ""
             
             # Try multiple preprocessing methods and get detailed results
-            text, method_results, freq_ratio = self._try_multiple_ocr_methods(img)
+            text, method_results, freq_ratio = self._try_multiple_ocr_methods(img, original_filename, page_num)
             
             # Log to API
             if self.enable_api_logging:
@@ -333,34 +416,46 @@ class PDFTextExtractor:
         prefix = parts[0]
         if len(prefix) == self.pattern_prefix_length and prefix.isalpha():
             score += 30
-            logger.info(f"  [PATTERN] ✓ Prefix '{prefix}' valid (1 letter)")
+            logger.info(f"  [PATTERN] [OK] Prefix '{prefix}' valid (1 letter)")
         else:
             score -= 20
-            logger.info(f"  [PATTERN] ✗ Prefix '{prefix}' invalid (expected 1 letter)")
+            logger.info(f"  [PATTERN] [X] Prefix '{prefix}' invalid (expected 1 letter)")
         
         # Validate Part 2: Country/Region (1-2 letters)
         country = parts[1]
         if (self.pattern_country_min <= len(country) <= self.pattern_country_max and 
             country.isalpha()):
             score += 30
-            logger.info(f"  [PATTERN] ✓ Country '{country}' valid ({len(country)} letter(s))")
+            logger.info(f"  [PATTERN] [OK] Country '{country}' valid ({len(country)} letter(s))")
         else:
             score -= 20
-            logger.info(f"  [PATTERN] ✗ Country '{country}' invalid (expected 1-2 letters)")
+            logger.info(f"  [PATTERN] [X] Country '{country}' invalid (expected 1-2 letters)")
         
         # Validate Part 3: Code/Type (2-4 alphanumeric)
         code = parts[2]
         if (self.pattern_code_min <= len(code) <= self.pattern_code_max and 
             code.isalnum()):
             score += 30
-            logger.info(f"  [PATTERN] ✓ Code '{code}' valid ({len(code)} char(s))")
+            logger.info(f"  [PATTERN] [OK] Code '{code}' valid ({len(code)} char(s))")
         else:
             score -= 20
-            logger.info(f"  [PATTERN] ✗ Code '{code}' invalid (expected 2-4 alphanumeric)")
+            logger.info(f"  [PATTERN] [X] Code '{code}' invalid (expected 2-4 alphanumeric)")
         
         # Validate Part 4: Serial/ID (7-10 alphanumeric)
         serial = parts[3].strip()  # Remove trailing spaces
         serial_clean = ''.join(c for c in serial if c.isalnum())  # Remove noise
+        
+        # Smart extraction: If serial is too long, try to extract valid prefix+digits pattern
+        if len(serial_clean) > self.pattern_serial_max and self.pattern_serial_allowed_prefixes:
+            # Try to extract pattern: allowed_prefix + digits (up to max length)
+            import re
+            prefix_pattern = '|'.join(self.pattern_serial_allowed_prefixes)
+            match = re.match(f'^([{prefix_pattern}])(\d+)', serial_clean, re.IGNORECASE)
+            if match:
+                extracted_serial = match.group(0)  # Get the matched part only
+                if self.pattern_serial_min <= len(extracted_serial) <= self.pattern_serial_max:
+                    logger.info(f"  [PATTERN] [SMART] Extracted '{extracted_serial}' from longer serial '{serial_clean}'")
+                    serial_clean = extracted_serial
         
         if self.pattern_serial_min <= len(serial_clean) <= self.pattern_serial_max:
             score += 40
@@ -375,56 +470,56 @@ class PDFTextExtractor:
                     # Validate first character
                     if first_char in self.pattern_serial_allowed_prefixes:
                         score += 30
-                        logger.info(f"  [PATTERN] ✓ Serial prefix '{first_char}' valid (allowed: {', '.join(self.pattern_serial_allowed_prefixes)})")
+                        logger.info(f"  [PATTERN] [OK] Serial prefix '{first_char}' valid (allowed: {', '.join(self.pattern_serial_allowed_prefixes)})")
                         
                         # Validate rest are digits
                         if rest_chars.isdigit():
                             digit_count = len(rest_chars)
                             score += 50
-                            logger.info(f"  [PATTERN] ★ PERFECT Serial format ({first_char} + {digit_count} digits)")
+                            logger.info(f"  [PATTERN] [PERFECT] Serial format ({first_char} + {digit_count} digits)")
                             
                             # Bonus for ideal length (8-9 total = 1 letter + 7-8 digits)
                             if len(serial_clean) in [8, 9]:
                                 score += 20
-                                logger.info(f"  [PATTERN] ★ Ideal length: {len(serial_clean)} chars")
+                                logger.info(f"  [PATTERN] [BONUS] Ideal length: {len(serial_clean)} chars")
                         else:
                             score -= 40
                             non_digit_count = sum(1 for c in rest_chars if not c.isdigit())
-                            logger.info(f"  [PATTERN] ✗ Serial has non-digit chars after prefix: {non_digit_count} invalid char(s)")
+                            logger.info(f"  [PATTERN] [X] Serial has non-digit chars after prefix: {non_digit_count} invalid char(s)")
                     else:
                         score -= 40
-                        logger.info(f"  [PATTERN] ✗ Serial prefix '{first_char}' invalid (allowed: {', '.join(self.pattern_serial_allowed_prefixes)})")
+                        logger.info(f"  [PATTERN] [X] Serial prefix '{first_char}' invalid (allowed: {', '.join(self.pattern_serial_allowed_prefixes)})")
             else:
                 # Legacy validation (no strict prefix requirement)
                 letter_count = sum(c.isalpha() for c in serial_clean)
                 digit_count = sum(c.isdigit() for c in serial_clean)
                 
-                logger.info(f"  [PATTERN] ✓ Serial '{serial_clean}' valid ({len(serial_clean)} chars: {letter_count} letter(s), {digit_count} digit(s))")
+                logger.info(f"  [PATTERN] [OK] Serial '{serial_clean}' valid ({len(serial_clean)} chars: {letter_count} letter(s), {digit_count} digit(s))")
                 
                 # Bonus for ideal format: 1 letter + 7-8 digits
                 if letter_count == 1 and 7 <= digit_count <= 8:
                     score += 50
-                    logger.info(f"  [PATTERN] ★ PERFECT Serial format (1 letter + {digit_count} digits)")
+                    logger.info(f"  [PATTERN] [PERFECT] Serial format (1 letter + {digit_count} digits)")
                 # Good format: mostly digits
                 elif digit_count >= 7:
                     score += 30
-                    logger.info(f"  [PATTERN] ✓ Good Serial format ({digit_count} digits)")
+                    logger.info(f"  [PATTERN] [OK] Good Serial format ({digit_count} digits)")
                 # Acceptable format
                 elif digit_count >= 6:
                     score += 10
                 else:
                     score -= 10
-                    logger.info(f"  [PATTERN] ⚠ Serial has few digits ({digit_count})")
+                    logger.info(f"  [PATTERN] [WARN] Serial has few digits ({digit_count})")
             
             # Penalize trailing noise (space + single char)
             if serial != serial_clean:
                 noise_chars = len(serial) - len(serial_clean)
                 penalty = noise_chars * 15
                 score -= penalty
-                logger.info(f"  [PATTERN] ⚠ Trailing noise detected: '{serial}' (penalty: -{penalty})")
+                logger.info(f"  [PATTERN] [WARN] Trailing noise detected: '{serial}' (penalty: -{penalty})")
         else:
             score -= 30
-            logger.info(f"  [PATTERN] ✗ Serial '{serial_clean}' invalid length: {len(serial_clean)} (expected {self.pattern_serial_min}-{self.pattern_serial_max})")
+            logger.info(f"  [PATTERN] [X] Serial '{serial_clean}' invalid length: {len(serial_clean)} (expected {self.pattern_serial_min}-{self.pattern_serial_max})")
         
         # Final score adjustment
         score = max(score, -1)  # Minimum score is -1 (invalid)
@@ -507,15 +602,57 @@ class PDFTextExtractor:
         best_result = final_scores[0]['text']
         logger.info(f"\n[FINAL DECISION] Selected: '{best_result}' (combined score: {final_scores[0]['combined_score']:.1f})")
         
+        # Apply smart serial extraction to final result
+        best_result = self._apply_smart_serial_extraction(best_result)
+        if best_result != final_scores[0]['text']:
+            logger.info(f"[SMART CLEAN] Cleaned result: '{best_result}'")
+        
         return best_result
     
-    def _try_multiple_ocr_methods(self, img):
+    def _apply_smart_serial_extraction(self, text):
+        """
+        Apply smart extraction to remove noise from serial number
+        
+        Args:
+            text: Full text pattern (e.g., 'P-F-W1A-S17995875COA2')
+            
+        Returns:
+            str: Cleaned text (e.g., 'P-F-W1A-S17995875')
+        """
+        if not text or not self.pattern_serial_allowed_prefixes:
+            return text
+        
+        parts = text.split(self.expected_separator)
+        if len(parts) != self.expected_parts:
+            return text
+        
+        # Check if last part (serial) is too long
+        serial = parts[3].strip()
+        serial_clean = ''.join(c for c in serial if c.isalnum())
+        
+        if len(serial_clean) > self.pattern_serial_max:
+            # Extract valid pattern: allowed_prefix + digits
+            import re
+            prefix_pattern = '|'.join(self.pattern_serial_allowed_prefixes)
+            match = re.match(f'^([{prefix_pattern}])(\d{{6,8}})', serial_clean, re.IGNORECASE)
+            if match:
+                extracted_serial = match.group(0)
+                parts[3] = extracted_serial
+                cleaned_text = self.expected_separator.join(parts)
+                logger.info(f"  [SMART EXTRACT] '{serial_clean}' -> '{extracted_serial}'")
+                return cleaned_text
+        
+        return text
+    
+    def _try_multiple_ocr_methods(self, img, original_filename="", page_num=1):
         """
         Try multiple preprocessing methods to extract text
         Uses parallel processing for speed improvement
         
         Args:
             img: PIL Image object
+            original_filename: Original PDF filename (for debug image naming)
+            page_num: Page number (for debug image naming)
             
         Returns:
             tuple: (best_text, method_results_dict, frequency_ratio)
@@ -523,12 +660,20 @@ class PDFTextExtractor:
                 - method_results_dict: Dictionary with all method results and scores
                 - frequency_ratio: Ratio of methods that agreed on best result (0.0-1.0)
         """
+        self._current_debug_filename = original_filename
+        self._current_debug_page = page_num
         results = []
         method_results = {}
         
         # Convert PIL to OpenCV format (shared across all methods)
         img_cv = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
         gray = cv2.cvtColor(img_cv, cv2.COLOR_BGR2GRAY)
+        
+        # Apply black text filtering if enabled (to ignore colored text/watermarks)
+        if self.ocr_filter_black_text:
+            # Keep only dark text (below threshold), make everything else white
+            _, gray = cv2.threshold(gray, self.ocr_black_threshold, 255, cv2.THRESH_TOZERO)
+            logger.info(f"[OCR] Applied black text filter (threshold: {self.ocr_black_threshold})")
         
         # Tesseract config for single line with specific characters
         custom_config = '--psm 7 --oem 3 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-'
@@ -638,7 +783,10 @@ class PDFTextExtractor:
         """Method 2: High threshold for bold text (FAST)"""
         logger.info("[M2] Method 2 (high threshold)...")
         _, thresh = cv2.threshold(gray, 200, 255, cv2.THRESH_BINARY)
-        cv2.imwrite("debug_method2_threshold.png", thresh)
+        if self.save_method_images:
+            debug_path = self._get_debug_path(self._current_debug_filename, self._current_debug_page, "method2_threshold")
+            if debug_path:
+                cv2.imwrite(debug_path, thresh)
         text = pytesseract.image_to_string(thresh, lang='eng', config=custom_config).strip()
         score = self._validate_and_score_result(text) if text else -1
         logger.info(f"  Method 2: '{text}' (score: {score})")
@@ -649,7 +797,10 @@ class PDFTextExtractor:
         logger.info("[M3] Method 3 (adaptive threshold)...")
         adaptive = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
                                         cv2.THRESH_BINARY, 11, 2)
-        cv2.imwrite("debug_method3_adaptive.png", adaptive)
+        if self.save_method_images:
+            debug_path = self._get_debug_path(self._current_debug_filename, self._current_debug_page, "method3_adaptive")
+            if debug_path:
+                cv2.imwrite(debug_path, adaptive)
         text = pytesseract.image_to_string(adaptive, lang='eng', config=custom_config).strip()
         score = self._validate_and_score_result(text) if text else -1
         logger.info(f"  Method 3: '{text}' (score: {score})")
@@ -660,7 +811,10 @@ class PDFTextExtractor:
         logger.info("[M4] Method 4 (OTSU + denoise)...")
         denoised = cv2.fastNlMeansDenoising(gray, None, 10, 7, 21)
         _, thresh = cv2.threshold(denoised, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-        cv2.imwrite("debug_method4_otsu.png", thresh)
+        if self.save_method_images:
+            debug_path = self._get_debug_path(self._current_debug_filename, self._current_debug_page, "method4_otsu")
+            if debug_path:
+                cv2.imwrite(debug_path, thresh)
         text = pytesseract.image_to_string(thresh, lang='eng', config=custom_config).strip()
         score = self._validate_and_score_result(text) if text else -1
         logger.info(f"  Method 4: '{text}' (score: {score})")
@@ -671,7 +825,10 @@ class PDFTextExtractor:
         logger.info("[M5] Method 5 (bilateral filter)...")
         filtered = cv2.bilateralFilter(gray, 9, 75, 75)
         _, thresh = cv2.threshold(filtered, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-        cv2.imwrite("debug_method5_bilateral.png", thresh)
+        if self.save_method_images:
+            debug_path = self._get_debug_path(self._current_debug_filename, self._current_debug_page, "method5_bilateral")
+            if debug_path:
+                cv2.imwrite(debug_path, thresh)
         text = pytesseract.image_to_string(thresh, lang='eng', config=custom_config).strip()
         score = self._validate_and_score_result(text) if text else -1
         logger.info(f"  Method 5: '{text}' (score: {score})")
@@ -694,7 +851,10 @@ class PDFTextExtractor:
         opening = cv2.morphologyEx(inverted, cv2.MORPH_OPEN, kernel, iterations=1)
         result = cv2.bitwise_not(opening)
         
-        cv2.imwrite("debug_method1_lineremoval.png", result)
+        if self.save_method_images:
+            debug_path = self._get_debug_path(self._current_debug_filename, self._current_debug_page, "method1_lineremoval")
+            if debug_path:
+                cv2.imwrite(debug_path, result)
         text = pytesseract.image_to_string(result, lang='eng', config=custom_config).strip()
         score = self._validate_and_score_result(text) if text else -1
         logger.info(f"  Method 1: '{text}' (score: {score})")
@@ -706,7 +866,10 @@ class PDFTextExtractor:
         kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (13, 5))
         blackhat = cv2.morphologyEx(gray, cv2.MORPH_BLACKHAT, kernel)
         _, thresh = cv2.threshold(blackhat, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-        cv2.imwrite("debug_method6_blackhat.png", thresh)
+        if self.save_method_images:
+            debug_path = self._get_debug_path(self._current_debug_filename, self._current_debug_page, "method6_blackhat")
+            if debug_path:
+                cv2.imwrite(debug_path, thresh)
         text = pytesseract.image_to_string(thresh, lang='eng', config=custom_config).strip()
         score = self._validate_and_score_result(text) if text else -1
         logger.info(f"  Method 6: '{text}' (score: {score})")
@@ -722,7 +885,10 @@ class PDFTextExtractor:
         sharpened = cv2.filter2D(enhanced, -1, kernel_sharpen)
         
         _, thresh = cv2.threshold(sharpened, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-        cv2.imwrite("debug_method0B_contrast.png", thresh)
+        if self.save_method_images:
+            debug_path = self._get_debug_path(self._current_debug_filename, self._current_debug_page, "method0B_contrast")
+            if debug_path:
+                cv2.imwrite(debug_path, thresh)
         text = pytesseract.image_to_string(thresh, lang='eng', config=custom_config).strip()
         score = self._validate_and_score_result(text) if text else -1
         logger.info(f"  Method 0B: '{text}' (score: {score})")
@@ -740,7 +906,10 @@ class PDFTextExtractor:
         dilate_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2))
         result = cv2.dilate(opening, dilate_kernel, iterations=1)
         
-        cv2.imwrite("debug_method0C_opening.png", result)
+        if self.save_method_images:
+            debug_path = self._get_debug_path(self._current_debug_filename, self._current_debug_page, "method0C_opening")
+            if debug_path:
+                cv2.imwrite(debug_path, result)
         text = pytesseract.image_to_string(result, lang='eng', config=custom_config).strip()
         score = self._validate_and_score_result(text) if text else -1
         logger.info(f"  Method 0C: '{text}' (score: {score})")
@@ -755,7 +924,10 @@ class PDFTextExtractor:
         kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 1))
         result = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel, iterations=1)
         
-        cv2.imwrite("debug_method7_median.png", result)
+        if self.save_method_images:
+            debug_path = self._get_debug_path(self._current_debug_filename, self._current_debug_page, "method7_median")
+            if debug_path:
+                cv2.imwrite(debug_path, result)
         text = pytesseract.image_to_string(result, lang='eng', config=custom_config).strip()
         score = self._validate_and_score_result(text) if text else -1
         logger.info(f"  Method 7: '{text}' (score: {score})")
@@ -780,7 +952,10 @@ class PDFTextExtractor:
         result = cv2.morphologyEx(result, cv2.MORPH_CLOSE, kernel)
         result = cv2.bitwise_not(result)
         
-        cv2.imwrite("debug_method0_hough.png", result)
+        if self.save_method_images:
+            debug_path = self._get_debug_path(self._current_debug_filename, self._current_debug_page, "method0_hough")
+            if debug_path:
+                cv2.imwrite(debug_path, result)
         text = pytesseract.image_to_string(result, lang='eng', config=custom_config).strip()
         score = self._validate_and_score_result(text) if text else -1
         logger.info(f"  Method 0: '{text}' (score: {score})")
