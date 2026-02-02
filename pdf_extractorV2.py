@@ -46,6 +46,7 @@ class PDFTextExtractor:
         
         # Format validation settings
         self.expected_parts = config.getint('Settings', 'expected_parts', fallback=4)
+        self.min_expected_parts = config.getint('Settings', 'min_expected_parts', fallback=3)  # Minimum parts for 3-part pattern
         self.expected_separator = config.get('Settings', 'expected_separator', fallback='-')
         self.expected_digit_count = config.getint('Settings', 'expected_digit_count', fallback=8)
         self.min_digit_count = config.getint('Settings', 'min_digit_count', fallback=6)
@@ -1178,9 +1179,9 @@ class PDFTextExtractor:
                 if success:
                     page_range = f"{start_page + 1}-{end_page + 1}"
                     split_results.append((output_path, header_text, page_range))
-                    logger.info(f"[PDF SPLITTING] ✓ Created: {Path(output_path).name} (pages {page_range}, header: '{header_text}')")
+                    logger.info(f"[PDF SPLITTING] [OK] Created: {Path(output_path).name} (pages {page_range}, header: '{header_text}')")
                 else:
-                    logger.error(f"[PDF SPLITTING] ✗ Failed to create split {idx}")
+                    logger.error(f"[PDF SPLITTING] [FAIL] Failed to create split {idx}")
             
             doc.close()
             
@@ -1252,25 +1253,35 @@ class PDFTextExtractor:
             groups = []
             current_start = 0
             current_header = page_headers[0][1]
+            current_headers_in_group = [page_headers[0][1]]  # Track all headers in group
             
             for i in range(1, len(page_headers)):
                 page_num, header = page_headers[i]
                 
                 # Check if header changed
                 if not self._headers_match(current_header, header, similarity_threshold):
-                    # Save current group
+                    # Save current group with best header
                     if current_header:  # Only save if header is not empty
-                        groups.append((current_start, i - 1, current_header))
-                        logger.info(f"[GROUP] Pages {current_start + 1}-{i}: '{current_header}'")
+                        best_header = self._select_best_header(current_headers_in_group)
+                        groups.append((current_start, i - 1, best_header))
+                        logger.info(f"[GROUP] Pages {current_start + 1}-{i}: '{best_header}'")
                     
                     # Start new group
                     current_start = i
                     current_header = header
+                    current_headers_in_group = [header]
+                else:
+                    # Same group - track this header too
+                    current_headers_in_group.append(header)
+                    # Update current_header if new one looks better
+                    if self._is_better_header(header, current_header):
+                        current_header = header
             
             # Add last group
             if current_header:
-                groups.append((current_start, len(page_headers) - 1, current_header))
-                logger.info(f"[GROUP] Pages {current_start + 1}-{len(page_headers)}: '{current_header}'")
+                best_header = self._select_best_header(current_headers_in_group)
+                groups.append((current_start, len(page_headers) - 1, best_header))
+                logger.info(f"[GROUP] Pages {current_start + 1}-{len(page_headers)}: '{best_header}'")
             
             # Filter out groups smaller than min_pages (if configured)
             if min_pages > 1:
@@ -1288,12 +1299,16 @@ class PDFTextExtractor:
     
     def _headers_match(self, header1, header2, threshold=1.0):
         """
-        Check if two headers match based on similarity threshold
+        Check if two headers match based on serial number (exact match only)
+        
+        When serial-based matching is enabled:
+        - If both headers have serial numbers -> use EXACT serial match only
+        - Serial must match exactly (e.g., S17996233 != S17996232)
         
         Args:
             header1: First header text
             header2: Second header text
-            threshold: Similarity threshold (0.0-1.0)
+            threshold: Similarity threshold (only used if serial matching is disabled)
             
         Returns:
             bool: True if headers match, False otherwise
@@ -1305,15 +1320,237 @@ class PDFTextExtractor:
         if header1 == header2:
             return True
         
-        # If threshold is 1.0, only exact match allowed
+        # Normalize both headers first (remove spaces, uppercase)
+        h1_normalized = self._normalize_header(header1)
+        h2_normalized = self._normalize_header(header2)
+        
+        if h1_normalized == h2_normalized:
+            logger.info(f"  [MATCH] Normalized match: '{header1}' == '{header2}'")
+            return True
+        
+        # Serial-based matching (STRICT - exact serial match only)
+        enable_serial_matching = self.config.getboolean('Settings', 'enable_serial_based_matching', fallback=True)
+        if enable_serial_matching:
+            serial1 = self._extract_serial_number(header1)
+            serial2 = self._extract_serial_number(header2)
+            
+            if serial1 and serial2:
+                # Normalize serials (remove spaces, keep only alphanumeric)
+                serial1_clean = ''.join(c for c in serial1 if c.isalnum())
+                serial2_clean = ''.join(c for c in serial2 if c.isalnum())
+                
+                if serial1_clean == serial2_clean:
+                    logger.info(f"  [MATCH] Serial exact match: '{serial1}' == '{serial2}'")
+                    return True
+                else:
+                    # Serial numbers are different - DO NOT match (no similarity fallback)
+                    logger.info(f"  [NO MATCH] Serial different: '{serial1}' != '{serial2}'")
+                    return False
+        
+        # Fallback to similarity only if serial matching is disabled
+        # or if one/both headers don't have valid serial numbers
         if threshold >= 1.0:
             return False
         
-        # Calculate similarity ratio
+        # Calculate similarity ratio on normalized headers
         from difflib import SequenceMatcher
-        ratio = SequenceMatcher(None, header1, header2).ratio()
+        ratio = SequenceMatcher(None, h1_normalized, h2_normalized).ratio()
         
-        return ratio >= threshold
+        if ratio >= threshold:
+            logger.info(f"  [MATCH] Similarity {ratio:.2f} >= {threshold}: '{header1}' ~ '{header2}'")
+            return True
+        
+        return False
+    
+    def _normalize_header(self, header):
+        """
+        Normalize header text for comparison
+        - Remove spaces
+        - Uppercase
+        - Fix common OCR errors in code part (WEE->WFE, WEFE->WFE, etc.)
+        
+        Args:
+            header: Header text
+            
+        Returns:
+            str: Normalized header
+        """
+        if not header:
+            return header
+        
+        # Remove spaces and uppercase
+        normalized = header.upper().replace(' ', '')
+        
+        # Fix common OCR errors in code part
+        # Known valid codes: WFE, WFH, GTX, etc.
+        # Common errors: WEE, WEFE, WHEE, WEH
+        code_fixes = {
+            'WEFE': 'WFE',
+            'WEE': 'WFE', 
+            'WHEE': 'WFE',
+            'WEH': 'WFH',
+            'WEFH': 'WFH',
+            'WFH': 'WFH',  # Keep as is
+            'WFE': 'WFE',  # Keep as is
+        }
+        
+        # Try to fix code part (Part 3 in 4-part format)
+        parts = normalized.split('-')
+        if len(parts) >= 3:
+            # Code is at index 2 for 4-part, or might be part of serial for 3-part
+            for i, part in enumerate(parts):
+                if part in code_fixes:
+                    parts[i] = code_fixes[part]
+            normalized = '-'.join(parts)
+        
+        return normalized
+    
+    def _extract_serial_number(self, header):
+        """
+        Extract serial number (last part) from header
+        
+        Args:
+            header: Full header text (e.g., 'B-HK-WFE-S17975746')
+            
+        Returns:
+            str: Serial number (e.g., 'S17975746') or None
+        """
+        if not header:
+            return None
+        
+        parts = header.split(self.expected_separator)
+        if len(parts) >= self.min_expected_parts:
+            # Last part is the serial
+            serial = parts[-1].strip()
+            # Remove any trailing noise
+            serial_clean = ''.join(c for c in serial if c.isalnum())
+            return serial_clean if serial_clean else None
+        
+        return None
+    
+    def _select_best_header(self, headers):
+        """
+        Select the best header from a list of similar headers
+        Uses scoring to pick the most likely correct one
+        
+        Args:
+            headers: List of header strings from the same group
+            
+        Returns:
+            str: Best header
+        """
+        if not headers:
+            return ""
+        
+        if len(headers) == 1:
+            return headers[0]
+        
+        # Score each header
+        scored = []
+        for header in headers:
+            score = self._score_header_quality(header)
+            scored.append((score, header))
+        
+        # Sort by score (highest first)
+        scored.sort(key=lambda x: x[0], reverse=True)
+        
+        best = scored[0][1]
+        if scored[0][1] != headers[0]:
+            logger.info(f"  [BEST HEADER] Selected '{best}' over '{headers[0]}' (score: {scored[0][0]})")
+        
+        return best
+    
+    def _score_header_quality(self, header):
+        """
+        Score header quality based on expected format
+        Higher score = more likely correct
+        
+        Args:
+            header: Header string
+            
+        Returns:
+            int: Quality score
+        """
+        if not header:
+            return 0
+        
+        score = 0
+        parts = header.split(self.expected_separator)
+        
+        # Check part count (3 or 4 is valid)
+        if self.min_expected_parts <= len(parts) <= self.expected_parts:
+            score += 20
+        else:
+            score -= 50  # Wrong structure
+        
+        if len(parts) < 2:
+            return score
+        
+        # Part 1: Single letter prefix (B, P, etc.)
+        if len(parts[0]) == 1 and parts[0].isalpha():
+            score += 10
+        
+        # Part 2: Country code (1-2 letters like HK, F, C)
+        if len(parts) > 1:
+            country = parts[1]
+            if 1 <= len(country) <= 2 and country.isalpha():
+                score += 10
+        
+        # Part 3 (4-part format): Code like WFE, WFH, GTX
+        if len(parts) == 4:
+            code = parts[2]
+            # Known good codes get bonus
+            known_codes = ['WFE', 'WFH', 'GTX', '5U5', 'W1A']
+            if code in known_codes:
+                score += 30  # Known good code
+            elif len(code) == 3 and code.isalnum():
+                score += 15  # Valid 3-char code
+            elif 'EE' in code or 'EFE' in code:
+                score -= 10  # Likely OCR error (WEE, WEFE)
+            elif len(code) > 4:
+                score -= 20  # Too long, likely error
+        
+        # Last part: Serial (S/R + 7-8 digits)
+        serial = parts[-1].strip()
+        serial_clean = ''.join(c for c in serial if c.isalnum())
+        
+        if serial_clean:
+            # Check prefix
+            if serial_clean[0].upper() in ['S', 'R']:
+                score += 15
+            
+            # Check if rest are digits
+            if len(serial_clean) > 1 and serial_clean[1:].isdigit():
+                score += 20
+            
+            # Check length (8-9 is ideal)
+            if 8 <= len(serial_clean) <= 9:
+                score += 10
+            
+            # Penalize spaces in serial
+            if ' ' in serial:
+                score -= 15
+        
+        # Penalize headers that look completely wrong
+        if header.startswith('-') or header.startswith('BL-'):
+            score -= 30
+        
+        return score
+    
+    def _is_better_header(self, new_header, current_header):
+        """
+        Check if new_header is better quality than current_header
+        
+        Args:
+            new_header: New header to compare
+            current_header: Current header
+            
+        Returns:
+            bool: True if new_header is better
+        """
+        new_score = self._score_header_quality(new_header)
+        current_score = self._score_header_quality(current_header)
+        return new_score > current_score
     
     def _create_split_pdf(self, source_doc, start_page, end_page, output_path):
         """

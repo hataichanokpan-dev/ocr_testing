@@ -27,13 +27,13 @@ def test_split_pdf(pdf_path, output_folder=None):
         print(f"❌ Error: config.ini not found at {config_path}")
         return False
     
-    print(f"✓ Loading config from: {config_path}")
+    print(f"[OK] Loading config from: {config_path}")
     config = ConfigParser()
     config.read(config_path)
     
     # Check if splitting is enabled
     splitting_enabled = config.getboolean('Settings', 'enable_pdf_splitting', fallback=False)
-    print(f"✓ PDF Splitting Enabled: {splitting_enabled}")
+    print(f"[OK] PDF Splitting Enabled: {splitting_enabled}")
     
     if not splitting_enabled:
         print("\n⚠️  WARNING: PDF splitting is disabled in config.ini")
@@ -45,10 +45,10 @@ def test_split_pdf(pdf_path, output_folder=None):
         print(f"❌ Error: Input PDF not found at {pdf_path}")
         return False
     
-    print(f"✓ Input PDF: {pdf_path}")
+    print(f"[OK] Input PDF: {pdf_path}")
     
     # Create extractor
-    print("✓ Creating PDFTextExtractor...")
+    print("[OK] Creating PDFTextExtractor...")
     extractor = PDFTextExtractor(config)
     
     # Perform split
@@ -71,7 +71,7 @@ def test_split_pdf(pdf_path, output_folder=None):
             print("   - min_pages_per_split threshold not met")
             return False
         
-        print(f"✓ Successfully created {len(split_results)} split file(s)\n")
+        print(f"[OK] Successfully created {len(split_results)} split file(s)\n")
         
         total_size = 0
         for i, (output_path, header_text, page_range) in enumerate(split_results, 1):
@@ -89,7 +89,7 @@ def test_split_pdf(pdf_path, output_folder=None):
         print(f"Original size:     {os.path.getsize(pdf_path):,} bytes")
         
         print("\n" + "=" * 70)
-        print("✓ TEST PASSED")
+        print("[OK] TEST PASSED")
         print("=" * 70)
         
         return True

@@ -67,7 +67,7 @@ def install_service():
     
     try:
         result = subprocess.run(cmd, capture_output=True, text=True, check=True)
-        print(f"✓ Service installed successfully")
+        print(f"[OK] Service installed successfully")
         
         # Set service display name
         subprocess.run([str(NSSM_PATH), "set", SERVICE_NAME, "DisplayName", SERVICE_DISPLAY_NAME], check=True)
@@ -90,7 +90,7 @@ def install_service():
         # Set service to restart on failure
         subprocess.run([str(NSSM_PATH), "set", SERVICE_NAME, "AppExit", "Default", "Restart"], check=True)
         
-        print(f"✓ Service configured successfully")
+        print(f"[OK] Service configured successfully")
         print(f"\nService details:")
         print(f"  Name: {SERVICE_NAME}")
         print(f"  Display Name: {SERVICE_DISPLAY_NAME}")
@@ -103,7 +103,7 @@ def install_service():
         return True
         
     except subprocess.CalledProcessError as e:
-        print(f"✗ Error installing service: {e}")
+        print(f"[FAIL] Error installing service: {e}")
         print(f"Output: {e.output if hasattr(e, 'output') else 'N/A'}")
         return False
 
@@ -123,7 +123,7 @@ def uninstall_service():
     # Stop service first
     try:
         subprocess.run([str(NSSM_PATH), "stop", SERVICE_NAME], capture_output=True)
-        print(f"✓ Service stopped")
+        print(f"[OK] Service stopped")
     except:
         pass
     
@@ -132,10 +132,10 @@ def uninstall_service():
     
     try:
         result = subprocess.run(cmd, capture_output=True, text=True, check=True)
-        print(f"✓ Service uninstalled successfully")
+        print(f"[OK] Service uninstalled successfully")
         return True
     except subprocess.CalledProcessError as e:
-        print(f"✗ Error uninstalling service: {e}")
+        print(f"[FAIL] Error uninstalling service: {e}")
         return False
 
 def start_service():
@@ -146,10 +146,10 @@ def start_service():
     
     try:
         subprocess.run(["net", "start", SERVICE_NAME], check=True)
-        print(f"✓ Service started successfully")
+        print(f"[OK] Service started successfully")
         return True
     except subprocess.CalledProcessError as e:
-        print(f"✗ Error starting service: {e}")
+        print(f"[FAIL] Error starting service: {e}")
         return False
 
 def stop_service():
@@ -160,10 +160,10 @@ def stop_service():
     
     try:
         subprocess.run(["net", "stop", SERVICE_NAME], check=True)
-        print(f"✓ Service stopped successfully")
+        print(f"[OK] Service stopped successfully")
         return True
     except subprocess.CalledProcessError as e:
-        print(f"✗ Error stopping service: {e}")
+        print(f"[FAIL] Error stopping service: {e}")
         return False
 
 def status_service():
