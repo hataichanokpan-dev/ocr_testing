@@ -90,8 +90,17 @@ class PDFTextExtractor:
         if self.save_debug_images:
             self._setup_debug_folder()
         
-        # Method execution order (best performing methods first for better user feedback)
-        self.method_priority = ['method2', 'method3', 'method4', 'method5', 'method1', 'method6', 'method0B', 'method0C', 'method7', 'method0']
+        # Method execution order - voting methods first for best accuracy
+        # method_ensemble: combines multiple preprocessing + configs with voting
+        # method_multiconfig: tries different PSM modes and votes
+        # method_multiscale: tries different zoom levels
+        self.method_priority = [
+            'method_ensemble',     # Best: Ensemble voting (most accurate)
+            'method_multiconfig',  # Multi-config PSM voting
+            'method_multiscale',   # Multi-scale OCR
+            'method2', 'method3', 'method4', 'method5',  # Fast single methods
+            'method1', 'method6', 'method0B', 'method0C', 'method7', 'method0'
+        ]
     
     def _setup_debug_folder(self):
         """Create debug folder structure and clean old images"""
@@ -324,6 +333,65 @@ class PDFTextExtractor:
             
             return "", {}, 0.0
     
+    def _apply_ocr_corrections(self, text):
+        """
+        Apply minimal STRUCTURAL OCR corrections only.
+        NO character-level fixes (E->F, WHE->WFE) - let voting handle accuracy.
+        
+        Only fixes:
+        - Trailing/leading dashes (artifacts)
+        - Double-prefix like BL-, RB- (structural error)
+        - Serial prefix 8->S (very common structural error)
+        
+        Args:
+            text: Raw OCR text
+            
+        Returns:
+            str: Corrected text
+        """
+        if not text:
+            return text
+        
+        original = text
+        
+        # 1. Remove trailing dash/noise (common artifact from underlines)
+        text = text.rstrip('-').rstrip()
+        
+        # 2. Remove leading dash if followed by valid pattern
+        if text.startswith('-'):
+            potential = text.lstrip('-')
+            parts = potential.split(self.expected_separator)
+            if len(parts) >= 3 and len(parts[0]) <= 2 and parts[0].isalpha():
+                text = potential
+                logger.info(f"  [STRUCT-FIX] Removed leading dash: '{original}' -> '{text}'")
+        
+        # 3. Fix obvious double-prefix (structural error, not character error)
+        parts = text.split(self.expected_separator)
+        if len(parts) >= 3:
+            prefix = parts[0].upper()
+            # Only fix when it's clearly a double-read of single letter
+            double_prefix_fixes = {
+                'BL': 'B',  # B read as BL
+                'RB': 'B',  # B read as RB  
+                'PL': 'P',  # P read as PL
+            }
+            if prefix in double_prefix_fixes:
+                parts[0] = double_prefix_fixes[prefix]
+                text = self.expected_separator.join(parts)
+                logger.info(f"  [STRUCT-FIX] Double prefix '{prefix}' -> '{parts[0]}': '{original}' -> '{text}'")
+        
+        # 4. Fix serial prefix: 8xxxxxxxx -> Sxxxxxxxx (very common OCR error)
+        #    Only if rest are all digits (structural pattern match)
+        parts = text.split(self.expected_separator)
+        if len(parts) >= 3:
+            serial = parts[-1]
+            if len(serial) >= 8 and serial[0] == '8' and serial[1:].isdigit():
+                parts[-1] = 'S' + serial[1:]
+                text = self.expected_separator.join(parts)
+                logger.info(f"  [STRUCT-FIX] Serial 8->S: '{original}' -> '{text}'")
+        
+        return text
+    
     def _validate_and_score_result(self, text):
         """
         Validate and score OCR result based on expected format from config
@@ -336,6 +404,9 @@ class PDFTextExtractor:
         """
         if not text or len(text) < 10:
             return -1
+        
+        # Apply OCR corrections first (R->B, WFHE->WFE, etc.)
+        text = self._apply_ocr_corrections(text)
         
         score = 0
         
@@ -392,8 +463,11 @@ class PDFTextExtractor:
     def _validate_with_pattern(self, text):
         """
         Validate text using detailed pattern rules
-        Format: [Prefix:1]-[Country/Region:1-2]-[Code/Type:2-4]-[Serial/ID:7-10]
-        Example: B-C-5U5-R4091534
+        Supports both 4-part and 3-part formats:
+        - 4-part: [Prefix:1]-[Country/Region:1-2]-[Code/Type:2-4]-[Serial/ID:7-10]
+          Example: B-HK-WFE-S17975643
+        - 3-part: [Prefix:1-2]-[Code/Type:2-4]-[Serial/ID:7-10]
+          Example: B-WFE-S17975643 (no country)
         
         Args:
             text: Text to validate
@@ -405,45 +479,79 @@ class PDFTextExtractor:
         
         # Split by separator
         parts = text.split(self.expected_separator)
+        num_parts = len(parts)
         
-        # Must have exactly 4 parts
-        if len(parts) != self.expected_parts:
-            logger.info(f"  [PATTERN] Invalid part count: {len(parts)} (expected {self.expected_parts})")
+        # Support both 3-part and 4-part formats
+        if num_parts < self.min_expected_parts or num_parts > self.expected_parts:
+            logger.info(f"  [PATTERN] Invalid part count: {num_parts} (expected {self.min_expected_parts}-{self.expected_parts})")
             return -1
         
-        score += 60  # Base score for correct structure
+        # Different scoring based on number of parts
+        if num_parts == 4:
+            # Full 4-part format: Prefix-Country-Code-Serial
+            score += 60  # Base score for correct structure
+            
+            # Validate Part 1: Prefix (1 letter)
+            prefix = parts[0]
+            if len(prefix) == self.pattern_prefix_length and prefix.isalpha():
+                score += 30
+                logger.info(f"  [PATTERN] [OK] Prefix '{prefix}' valid (1 letter)")
+            else:
+                score -= 20
+                logger.info(f"  [PATTERN] [X] Prefix '{prefix}' invalid (expected 1 letter)")
+            
+            # Validate Part 2: Country/Region (1-2 letters)
+            country = parts[1]
+            if (self.pattern_country_min <= len(country) <= self.pattern_country_max and 
+                country.isalpha()):
+                score += 30
+                logger.info(f"  [PATTERN] [OK] Country '{country}' valid ({len(country)} letter(s))")
+            else:
+                score -= 20
+                logger.info(f"  [PATTERN] [X] Country '{country}' invalid (expected 1-2 letters)")
+            
+            # Validate Part 3: Code/Type (2-4 alphanumeric)
+            code = parts[2]
+            if (self.pattern_code_min <= len(code) <= self.pattern_code_max and 
+                code.isalnum()):
+                score += 30
+                logger.info(f"  [PATTERN] [OK] Code '{code}' valid ({len(code)} char(s))")
+            else:
+                score -= 20
+                logger.info(f"  [PATTERN] [X] Code '{code}' invalid (expected 2-4 alphanumeric)")
+            
+            # Serial is in part 4
+            serial = parts[3].strip()
+            
+        elif num_parts == 3:
+            # Shortened 3-part format: Prefix-Code-Serial (no country)
+            score += 40  # Lower base score for 3-part (less complete)
+            
+            # Validate Part 1: Prefix (1-2 letters for 3-part, more flexible)
+            prefix = parts[0]
+            if len(prefix) <= 2 and prefix.isalpha():
+                score += 20
+                logger.info(f"  [PATTERN] [OK] Prefix '{prefix}' valid (3-part format, {len(prefix)} letter(s))")
+            else:
+                score -= 20
+                logger.info(f"  [PATTERN] [X] Prefix '{prefix}' invalid (expected 1-2 letters)")
+            
+            # Validate Part 2: Code/Type (2-5 alphanumeric, more flexible for 3-part)
+            code = parts[1]
+            if 2 <= len(code) <= 5 and code.isalnum():
+                score += 20
+                logger.info(f"  [PATTERN] [OK] Code '{code}' valid ({len(code)} char(s))")
+            else:
+                score -= 20
+                logger.info(f"  [PATTERN] [X] Code '{code}' invalid (expected 2-5 alphanumeric)")
+            
+            # Serial is in part 3
+            serial = parts[2].strip()
         
-        # Validate Part 1: Prefix (1 letter)
-        prefix = parts[0]
-        if len(prefix) == self.pattern_prefix_length and prefix.isalpha():
-            score += 30
-            logger.info(f"  [PATTERN] [OK] Prefix '{prefix}' valid (1 letter)")
         else:
-            score -= 20
-            logger.info(f"  [PATTERN] [X] Prefix '{prefix}' invalid (expected 1 letter)")
+            return -1
         
-        # Validate Part 2: Country/Region (1-2 letters)
-        country = parts[1]
-        if (self.pattern_country_min <= len(country) <= self.pattern_country_max and 
-            country.isalpha()):
-            score += 30
-            logger.info(f"  [PATTERN] [OK] Country '{country}' valid ({len(country)} letter(s))")
-        else:
-            score -= 20
-            logger.info(f"  [PATTERN] [X] Country '{country}' invalid (expected 1-2 letters)")
-        
-        # Validate Part 3: Code/Type (2-4 alphanumeric)
-        code = parts[2]
-        if (self.pattern_code_min <= len(code) <= self.pattern_code_max and 
-            code.isalnum()):
-            score += 30
-            logger.info(f"  [PATTERN] [OK] Code '{code}' valid ({len(code)} char(s))")
-        else:
-            score -= 20
-            logger.info(f"  [PATTERN] [X] Code '{code}' invalid (expected 2-4 alphanumeric)")
-        
-        # Validate Part 4: Serial/ID (7-10 alphanumeric)
-        serial = parts[3].strip()  # Remove trailing spaces
+        # Common validation for Serial (same for both formats)
         serial_clean = ''.join(c for c in serial if c.isalnum())  # Remove noise
         
         # Smart extraction: If serial is too long, try to extract valid prefix+digits pattern
@@ -680,7 +788,13 @@ class PDFTextExtractor:
         custom_config = '--psm 7 --oem 3 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-'
         
         # Define all methods with their execution functions
+        # Voting methods first (most accurate), then single methods
         method_functions = {
+            # NEW: Voting-based methods (best accuracy)
+            'method_ensemble': self._method_ensemble,
+            'method_multiconfig': self._method_multiconfig,
+            'method_multiscale': self._method_multiscale,
+            # Original single methods
             'method0': self._method0_hough,
             'method0B': self._method0B_contrast,
             'method0C': self._method0C_opening,
@@ -750,12 +864,15 @@ class PDFTextExtractor:
             frequency = Counter(results)
             logger.info(f"Result frequencies: {dict(frequency)}")
             
-            # Score all unique results
+            # Score all unique results (with OCR corrections applied)
             scored_results = []
             for text in set(results):
-                score = self._validate_and_score_result(text)
+                # Apply OCR corrections first
+                corrected_text = self._apply_ocr_corrections(text)
+                score = self._validate_and_score_result(text)  # This also applies corrections internally
                 if score >= 0:
-                    scored_results.append((score, frequency[text], text))
+                    # Use corrected text in results
+                    scored_results.append((score, frequency[text], corrected_text))
             
             if scored_results:
                 # Sort by: 1) Score (desc), 2) Frequency (desc), 3) Length (asc)
@@ -962,6 +1079,251 @@ class PDFTextExtractor:
         logger.info(f"  Method 0: '{text}' (score: {score})")
         return text, score
     
+    # ========== NEW: Voting-based OCR Methods ==========
+    
+    def _method_ensemble(self, gray, custom_config):
+        """
+        ENSEMBLE VOTING: Run multiple preprocessing + configs, vote for best result.
+        This is the most accurate method for handling OCR ambiguity (E/F, W/H, etc.)
+        
+        Instead of hard-coding character fixes, we let multiple OCR runs vote.
+        """
+        logger.info("[M-ENS] Ensemble voting (best accuracy)...")
+        
+        all_results = []
+        
+        # Multiple preprocessing methods
+        preprocessed_images = {}
+        
+        # 1. Simple threshold
+        _, thresh_simple = cv2.threshold(gray, 200, 255, cv2.THRESH_BINARY)
+        preprocessed_images['thresh'] = thresh_simple
+        
+        # 2. OTSU threshold
+        _, thresh_otsu = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        preprocessed_images['otsu'] = thresh_otsu
+        
+        # 3. Adaptive threshold
+        thresh_adaptive = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
+                                                cv2.THRESH_BINARY, 11, 2)
+        preprocessed_images['adaptive'] = thresh_adaptive
+        
+        # 4. OTSU with denoise
+        denoised = cv2.fastNlMeansDenoising(gray, None, 10, 7, 21)
+        _, thresh_denoised = cv2.threshold(denoised, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        preprocessed_images['denoised'] = thresh_denoised
+        
+        # 5. Morphological cleaning (good for bold text)
+        _, binary_inv = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2))
+        cleaned = cv2.morphologyEx(binary_inv, cv2.MORPH_OPEN, kernel)
+        preprocessed_images['morph'] = cv2.bitwise_not(cleaned)
+        
+        # Multiple Tesseract configs
+        configs = [
+            ('PSM7', '--psm 7 --oem 3 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-'),
+            ('PSM8', '--psm 8 --oem 3 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-'),
+            ('PSM13', '--psm 13 --oem 3 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-'),
+        ]
+        
+        # Run OCR on all combinations
+        for preproc_name, img in preprocessed_images.items():
+            for config_name, config in configs:
+                try:
+                    text = pytesseract.image_to_string(img, lang='eng', config=config).strip()
+                    if text and len(text) >= 10:  # Minimum length for valid header
+                        score = self._validate_and_score_result(text)
+                        if score > 0:
+                            all_results.append((text, score, f"{preproc_name}+{config_name}"))
+                            logger.info(f"    {preproc_name}+{config_name}: '{text}' (score: {score})")
+                except Exception as e:
+                    logger.debug(f"    {preproc_name}+{config_name} failed: {e}")
+        
+        if not all_results:
+            logger.info("  [ENSEMBLE] No valid results")
+            return "", -1
+        
+        # Vote for best result based on serial number (most reliable part)
+        from collections import Counter, defaultdict
+        
+        # Group results by extracted serial number
+        serial_groups = defaultdict(list)
+        for text, score, method in all_results:
+            serial = self._extract_serial_number(text)
+            if serial:
+                serial_groups[serial].append((text, score, method))
+        
+        if not serial_groups:
+            # Fallback: pick highest scoring result
+            all_results.sort(key=lambda x: x[1], reverse=True)
+            best_text = all_results[0][0]
+            best_score = all_results[0][1]
+            logger.info(f"  [ENSEMBLE] Fallback best: '{best_text}' (score: {best_score})")
+            return best_text, best_score
+        
+        # Find the serial with most votes
+        serial_votes = {s: len(results) for s, results in serial_groups.items()}
+        best_serial = max(serial_votes.keys(), key=lambda s: serial_votes[s])
+        
+        # From that serial group, pick the highest scoring full result
+        group_results = serial_groups[best_serial]
+        group_results.sort(key=lambda x: x[1], reverse=True)
+        best_text = group_results[0][0]
+        best_score = group_results[0][1]
+        
+        total_votes = len(all_results)
+        serial_vote_count = len(group_results)
+        
+        logger.info(f"  [ENSEMBLE] Winner: '{best_text}' (score: {best_score}, votes: {serial_vote_count}/{total_votes})")
+        
+        # Save debug image
+        if self.save_method_images:
+            debug_path = self._get_debug_path(self._current_debug_filename, self._current_debug_page, "method_ensemble")
+            if debug_path:
+                cv2.imwrite(debug_path, thresh_otsu)
+        
+        return best_text, best_score
+    
+    def _method_multiconfig(self, gray, custom_config):
+        """
+        MULTI-CONFIG: Try different Tesseract PSM modes and vote for best.
+        Different PSM modes can recognize the same text differently.
+        """
+        logger.info("[M-MULTI] Multi-config PSM voting...")
+        
+        # Preprocess with OTSU (reliable default)
+        _, thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        
+        results = []
+        
+        # Different PSM modes to try
+        psm_configs = [
+            ('PSM6', '--psm 6 --oem 3 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-'),  # Block of text
+            ('PSM7', '--psm 7 --oem 3 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-'),  # Single line
+            ('PSM8', '--psm 8 --oem 3 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-'),  # Single word
+            ('PSM13', '--psm 13 --oem 3 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-'), # Raw line
+        ]
+        
+        for name, config in psm_configs:
+            try:
+                text = pytesseract.image_to_string(thresh, lang='eng', config=config).strip()
+                if text and len(text) >= 10:
+                    score = self._validate_and_score_result(text)
+                    if score > 0:
+                        results.append((text, score))
+                        logger.info(f"    {name}: '{text}' (score: {score})")
+            except:
+                pass
+        
+        # Also try with morphological cleaned image
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2))
+        cleaned = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, kernel)
+        
+        for name, config in [('PSM7-CLEAN', psm_configs[1][1])]:
+            try:
+                text = pytesseract.image_to_string(cleaned, lang='eng', config=config).strip()
+                if text and len(text) >= 10:
+                    score = self._validate_and_score_result(text)
+                    if score > 0:
+                        results.append((text, score))
+                        logger.info(f"    {name}: '{text}' (score: {score})")
+            except:
+                pass
+        
+        if not results:
+            logger.info("  [MULTICONFIG] No valid results")
+            return "", -1
+        
+        # Vote based on serial number
+        from collections import defaultdict
+        
+        serial_groups = defaultdict(list)
+        for text, score in results:
+            serial = self._extract_serial_number(text)
+            if serial:
+                serial_groups[serial].append((text, score))
+        
+        if serial_groups:
+            # Pick serial with most votes
+            best_serial = max(serial_groups.keys(), key=lambda s: len(serial_groups[s]))
+            group = serial_groups[best_serial]
+            group.sort(key=lambda x: x[1], reverse=True)
+            best_text, best_score = group[0]
+            
+            logger.info(f"  [MULTICONFIG] Winner: '{best_text}' (votes: {len(group)}/{len(results)})")
+        else:
+            # Fallback to highest score
+            results.sort(key=lambda x: x[1], reverse=True)
+            best_text, best_score = results[0]
+            logger.info(f"  [MULTICONFIG] Fallback: '{best_text}' (score: {best_score})")
+        
+        # Save debug image
+        if self.save_method_images:
+            debug_path = self._get_debug_path(self._current_debug_filename, self._current_debug_page, "method_multiconfig")
+            if debug_path:
+                cv2.imwrite(debug_path, thresh)
+        
+        return best_text, best_score
+    
+    def _method_multiscale(self, gray, custom_config):
+        """
+        MULTI-SCALE: Try different zoom levels and pick best result.
+        Helps when font size doesn't match Tesseract's optimal range.
+        """
+        logger.info("[M-SCALE] Multi-scale OCR...")
+        
+        results = []
+        
+        # Different scale factors to try
+        scales = [1.0, 0.75, 1.5, 2.0]
+        
+        for scale in scales:
+            h, w = gray.shape
+            new_w = int(w * scale)
+            new_h = int(h * scale)
+            
+            # Skip if too small
+            if new_w < 100 or new_h < 30:
+                continue
+            
+            # Resize
+            if scale != 1.0:
+                scaled = cv2.resize(gray, (new_w, new_h), interpolation=cv2.INTER_CUBIC)
+            else:
+                scaled = gray
+            
+            # Apply OTSU threshold
+            _, thresh = cv2.threshold(scaled, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+            
+            try:
+                text = pytesseract.image_to_string(thresh, lang='eng', config=custom_config).strip()
+                if text and len(text) >= 10:
+                    score = self._validate_and_score_result(text)
+                    if score > 0:
+                        results.append((text, score, scale))
+                        logger.info(f"    Scale {scale}x: '{text}' (score: {score})")
+            except:
+                pass
+        
+        if not results:
+            logger.info("  [MULTISCALE] No valid results")
+            return "", -1
+        
+        # Pick highest scoring result
+        results.sort(key=lambda x: x[1], reverse=True)
+        best_text, best_score, best_scale = results[0]
+        
+        logger.info(f"  [MULTISCALE] Best at {best_scale}x: '{best_text}' (score: {best_score})")
+        
+        # Save debug image (at original scale with OTSU)
+        if self.save_method_images:
+            debug_path = self._get_debug_path(self._current_debug_filename, self._current_debug_page, "method_multiscale")
+            if debug_path:
+                _, debug_img = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+                cv2.imwrite(debug_path, debug_img)
+        
+        return best_text, best_score
+
     def _send_extraction_log(self, original_filename, page_number, method_results, 
                             direct_text="", direct_score=None, final_answer="", 
                             debug_image_path="", status="success", error_message=""):
@@ -1367,7 +1729,7 @@ class PDFTextExtractor:
         Normalize header text for comparison
         - Remove spaces
         - Uppercase
-        - Fix common OCR errors in code part (WEE->WFE, WEFE->WFE, etc.)
+        - NO character-level fixes (let voting handle accuracy)
         
         Args:
             header: Header text
@@ -1378,30 +1740,9 @@ class PDFTextExtractor:
         if not header:
             return header
         
-        # Remove spaces and uppercase
+        # Only remove spaces and uppercase - no character fixes
+        # Let the voting-based OCR methods handle accuracy
         normalized = header.upper().replace(' ', '')
-        
-        # Fix common OCR errors in code part
-        # Known valid codes: WFE, WFH, GTX, etc.
-        # Common errors: WEE, WEFE, WHEE, WEH
-        code_fixes = {
-            'WEFE': 'WFE',
-            'WEE': 'WFE', 
-            'WHEE': 'WFE',
-            'WEH': 'WFH',
-            'WEFH': 'WFH',
-            'WFH': 'WFH',  # Keep as is
-            'WFE': 'WFE',  # Keep as is
-        }
-        
-        # Try to fix code part (Part 3 in 4-part format)
-        parts = normalized.split('-')
-        if len(parts) >= 3:
-            # Code is at index 2 for 4-part, or might be part of serial for 3-part
-            for i, part in enumerate(parts):
-                if part in code_fixes:
-                    parts[i] = code_fixes[part]
-            normalized = '-'.join(parts)
         
         return normalized
     
