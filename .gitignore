@@ -37,6 +37,8 @@ debug_*.jpg
 # Data files
 test_*.pdf
 output_*.pdf
+output*.pdf
+input*.pdf
 example_*.pdf
 
 # Log files
