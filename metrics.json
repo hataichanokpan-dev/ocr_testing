@@ -1,0 +1,36 @@
+{
+  "summary": {
+    "total_jobs": 1,
+    "active_jobs": 0,
+    "avg_processing_time_seconds": 13.19,
+    "total_processing_time_seconds": 13.19,
+    "total_ocr_attempts": 68,
+    "total_ocr_successful": 68,
+    "ocr_success_rate": 100.0,
+    "total_api_calls": 0,
+    "total_api_success": 0,
+    "api_success_rate": 0.0,
+    "fastest_job": 13.189387083053589,
+    "slowest_job": 13.189387083053589
+  },
+  "timestamp": "2026-02-05T09:53:16.582953",
+  "completed_jobs": [
+    {
+      "job_id": "cb6f0537",
+      "filename": "20260130151057165.pdf",
+      "processing_time_seconds": 13.19,
+      "total_pages": 68,
+      "processed_pages": 0,
+      "ocr_attempts": 68,
+      "ocr_successful": 68,
+      "success_rate": 100.0,
+      "best_score": 150,
+      "api_calls": 0,
+      "api_success": 0,
+      "api_failures": 0,
+      "api_success_rate": 0.0,
+      "errors_count": 0,
+      "errors": []
+    }
+  ]
+}
