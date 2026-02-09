@@ -65,11 +65,26 @@ class ExtractionConfig:
     ocr_filter_black_text: bool = True
     ocr_black_threshold: int = 100
     
+    # OCR Enhancement (V3.1 - Full Upgrade)
+    tesseract_psm_mode: int = 7
+    tesseract_char_whitelist: str = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-'
+    enable_deskewing: bool = True
+    enable_morphological_ops: bool = True
+    enable_clahe: bool = True
+    enable_multi_engine: bool = False
+    use_easyocr: bool = False
+    use_paddleocr: bool = False
+    enable_pattern_correction: bool = True
+    
     # Input/Output paths (NEW in V3)
     input_folder: str = 'input'
     output_base_dir: str = 'output'
     organize_by_year_and_date: bool = True
     output_retention_days: int = 90
+    
+    # Reports paths (V3.1)
+    reports_base_dir: str = 'reports'
+    reports_organize_by_date: bool = True
     
     # Debug images
     save_debug_images: bool = True
@@ -210,11 +225,26 @@ class ConfigManager:
             ocr_filter_black_text=settings.getboolean('ocr_filter_black_text', True),
             ocr_black_threshold=settings.getint('ocr_black_threshold', 100),
             
+            # OCR Enhancement (V3.1)
+            tesseract_psm_mode=settings.getint('tesseract_psm_mode', 7),
+            tesseract_char_whitelist=settings.get('tesseract_char_whitelist', 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-'),
+            enable_deskewing=settings.getboolean('enable_deskewing', True),
+            enable_morphological_ops=settings.getboolean('enable_morphological_ops', True),
+            enable_clahe=settings.getboolean('enable_clahe', True),
+            enable_multi_engine=settings.getboolean('enable_multi_engine', False),
+            use_easyocr=settings.getboolean('use_easyocr', False),
+            use_paddleocr=settings.getboolean('use_paddleocr', False),
+            enable_pattern_correction=settings.getboolean('enable_pattern_correction', True),
+            
             # Input/Output paths
             input_folder=settings.get('input_folder', 'input'),
             output_base_dir=settings.get('output_base_dir', 'output'),
             organize_by_year_and_date=settings.getboolean('organize_by_year_and_date', True),
             output_retention_days=settings.getint('output_retention_days', 90),
+            
+            # Reports paths (V3.1)
+            reports_base_dir=settings.get('reports_base_dir', 'reports'),
+            reports_organize_by_date=settings.getboolean('reports_organize_by_date', True),
             
             # Debug images
             save_debug_images=settings.getboolean('save_debug_images', True),

@@ -123,6 +123,7 @@ class PdfSplitter:
         
         results = []
         original_name = Path(pdf_path).stem
+        filename_counter = {}  # Track duplicate filenames
         
         # Create split PDFs
         for idx, (start_page, end_page, header_text) in enumerate(groups, 1):
@@ -130,8 +131,8 @@ class PdfSplitter:
                 # Sanitize header for filename
                 safe_header = self._sanitize_filename(header_text)
                 
-                # Generate filename from pattern
-                filename = self.config.split_naming_pattern.format(
+                # Generate base filename from pattern
+                base_filename = self.config.split_naming_pattern.format(
                     header=safe_header,
                     start=start_page + 1,  # 1-based for display
                     end=end_page + 1,
@@ -139,10 +140,25 @@ class PdfSplitter:
                     index=idx
                 )
                 
-                if not filename.endswith('.pdf'):
-                    filename += '.pdf'
+                if not base_filename.endswith('.pdf'):
+                    base_filename += '.pdf'
                 
-                # Get organized output path (overwrite if exists)
+                # Handle duplicate filenames
+                filename = base_filename
+                if safe_header in filename_counter:
+                    # Duplicate detected - add suffix
+                    filename_counter[safe_header] += 1
+                    suffix = filename_counter[safe_header]
+                    # Insert suffix before .pdf extension
+                    filename = base_filename.replace('.pdf', f'_{suffix:02d}.pdf')
+                    logger.warning(
+                        f"Duplicate filename detected for header '{header_text}' - "
+                        f"Using '{filename}' (pages {start_page + 1}-{end_page + 1})"
+                    )
+                else:
+                    filename_counter[safe_header] = 1
+                
+                # Get organized output path
                 output_path = self.output_organizer.get_output_path(filename)
                 
                 # Create new PDF with pages

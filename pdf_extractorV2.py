@@ -79,6 +79,23 @@ class PDFTextExtractor:
         self.ocr_filter_black_text = config.getboolean('Settings', 'ocr_filter_black_text', fallback=True)
         self.ocr_black_threshold = config.getint('Settings', 'ocr_black_threshold', fallback=100)
         
+        # OCR Enhancement (V3.1 - Full Upgrade)
+        self.tesseract_psm_mode = config.getint('Settings', 'tesseract_psm_mode', fallback=7)
+        self.tesseract_char_whitelist = config.get('Settings', 'tesseract_char_whitelist', 
+                                                    fallback='ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-')
+        self.enable_deskewing = config.getboolean('Settings', 'enable_deskewing', fallback=True)
+        self.enable_morphological_ops = config.getboolean('Settings', 'enable_morphological_ops', fallback=True)
+        self.enable_clahe = config.getboolean('Settings', 'enable_clahe', fallback=True)
+        self.enable_pattern_correction = config.getboolean('Settings', 'enable_pattern_correction', fallback=True)
+        
+        logger.info(f"OCR Enhancements enabled:")
+        logger.info(f"  PSM Mode: {self.tesseract_psm_mode} (7=single line)")
+        logger.info(f"  Character Whitelist: {self.tesseract_char_whitelist[:30]}...")
+        logger.info(f"  Deskewing: {self.enable_deskewing}")
+        logger.info(f"  Morphological: {self.enable_morphological_ops}")
+        logger.info(f"  CLAHE: {self.enable_clahe}")
+        logger.info(f"  Pattern Correction: {self.enable_pattern_correction}")
+        
         # Debug image settings
         self.save_debug_images = config.getboolean('Settings', 'save_debug_images', fallback=True)
         self.debug_images_folder = config.get('Settings', 'debug_images_folder', fallback='debug_images')
@@ -898,14 +915,25 @@ class PDFTextExtractor:
     # ========== OCR Method Implementations ==========
     
     def _method2_threshold(self, gray, custom_config):
-        """Method 2: High threshold for bold text (FAST)"""
-        logger.info("[M2] Method 2 (high threshold)...")
-        _, thresh = cv2.threshold(gray, 200, 255, cv2.THRESH_BINARY)
+        """Method 2: High threshold for bold text (FAST) + V3.1 Enhancements"""
+        logger.info("[M2] Method 2 (high threshold + enhancements)...")
+        
+        # Apply V3.1 pre-processing
+        processed = self._apply_v31_preprocessing(gray)
+        
+        _, thresh = cv2.threshold(processed, 200, 255, cv2.THRESH_BINARY)
         if self.save_method_images:
             debug_path = self._get_debug_path(self._current_debug_filename, self._current_debug_page, "method2_threshold")
             if debug_path:
                 cv2.imwrite(debug_path, thresh)
-        text = pytesseract.image_to_string(thresh, lang='eng', config=custom_config).strip()
+        
+        # Use optimized Tesseract config
+        config = self._get_optimized_tesseract_config()
+        text = pytesseract.image_to_string(thresh, lang='eng', config=config).strip()
+        
+        # Apply pattern correction
+        text = self._apply_pattern_correction(text)
+        
         score = self._validate_and_score_result(text) if text else -1
         logger.info(f"  Method 2: '{text}' (score: {score})")
         return text, score
@@ -1997,3 +2025,134 @@ class PDFTextExtractor:
                 
         except Exception as e:
             logger.error(f"[API LOG] Failed to send split log: {e}")
+    
+    # ========== V3.1 OCR Enhancement Methods ==========
+    
+    def _apply_v31_preprocessing(self, gray: np.ndarray) -> np.ndarray:
+        """
+        Apply V3.1 image enhancements before OCR
+        
+        Args:
+            gray: Grayscale image
+        
+        Returns:
+            Enhanced image
+        """
+        enhanced = gray.copy()
+        
+        # 1. Deskewing
+        if self.enable_deskewing:
+            enhanced = self._deskew_image(enhanced)
+        
+        # 2. CLAHE (Contrast enhancement)
+        if self.enable_clahe:
+            clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+            enhanced = clahe.apply(enhanced)
+        
+        # 3. Morphological operations
+        if self.enable_morphological_ops:
+            kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2))
+            enhanced = cv2.morphologyEx(enhanced, cv2.MORPH_CLOSE, kernel)
+        
+        return enhanced
+    
+    def _deskew_image(self, image: np.ndarray) -> np.ndarray:
+        """Auto-rotate image to fix skew"""
+        try:
+            # Detect skew using Hough lines
+            thresh = cv2.threshold(image, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1]
+            edges = cv2.Canny(thresh, 50, 150, apertureSize=3)
+            lines = cv2.HoughLinesP(edges, 1, np.pi / 180, 100, minLineLength=100, maxLineGap=10)
+            
+            if lines is None or len(lines) == 0:
+                return image
+            
+            # Calculate median angle
+            angles = []
+            for line in lines:
+                x1, y1, x2, y2 = line[0]
+                angle = np.degrees(np.arctan2(y2 - y1, x2 - x1))
+                angles.append(angle)
+            
+            median_angle = np.median(angles)
+            if median_angle < -45:
+                median_angle = 90 + median_angle
+            elif median_angle > 45:
+                median_angle = median_angle - 90
+            
+            # Rotate if angle is significant
+            if abs(median_angle) > 0.5:
+                (h, w) = image.shape[:2]
+                center = (w // 2, h // 2)
+                M = cv2.getRotationMatrix2D(center, median_angle, 1.0)
+                rotated = cv2.warpAffine(image, M, (w, h), 
+                                        flags=cv2.INTER_CUBIC,
+                                        borderMode=cv2.BORDER_REPLICATE)
+                logger.debug(f"[DESKEW] Rotated by {median_angle:.2f}°")
+                return rotated
+            
+            return image
+        except Exception as e:
+            logger.warning(f"[DESKEW] Failed: {e}")
+            return image
+    
+    def _get_optimized_tesseract_config(self) -> str:
+        """
+        Get optimized Tesseract configuration
+        
+        Returns:
+            Config string with PSM mode and whitelist
+        """
+        config_parts = [
+            f'--psm {self.tesseract_psm_mode}',
+            '--oem 3'
+        ]
+        
+        if self.tesseract_char_whitelist:
+            config_parts.append(f'-c tessedit_char_whitelist={self.tesseract_char_whitelist}')
+        
+        return ' '.join(config_parts)
+    
+    def _apply_pattern_correction(self, text: str) -> str:
+        """
+        Apply pattern-based corrections for common OCR mistakes
+        
+        Args:
+            text: OCR result
+        
+        Returns:
+            Corrected text
+        """
+        if not self.enable_pattern_correction or not text:
+            return text
+        
+        try:
+            parts = text.split(self.expected_separator)
+            
+            if len(parts) >= 4:
+                # Correct serial number (last part)
+                serial = parts[-1]
+                original = serial
+                
+                if len(serial) > 1:
+                    prefix = serial[0] if serial[0].isalpha() else ''
+                    digits = serial[1:] if prefix else serial
+                    
+                    # Common OCR mistakes
+                    corrected = digits
+                    corrected = corrected.replace('O', '0')
+                    corrected = corrected.replace('o', '0')
+                    corrected = corrected.replace('l', '1')
+                    corrected = corrected.replace('I', '1')
+                    corrected = corrected.replace('Z', '2')
+                    
+                    if corrected != digits:
+                        parts[-1] = prefix + corrected
+                        result = self.expected_separator.join(parts)
+                        logger.debug(f"[PATTERN-CORRECT] '{text}' → '{result}'")
+                        return result
+            
+            return text
+        except Exception:
+            return text
+

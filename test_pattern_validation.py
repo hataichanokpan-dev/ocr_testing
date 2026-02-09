@@ -11,7 +11,7 @@ config = configparser.ConfigParser()
 config['Settings'] = {
     'header_area_top': '2',
     'header_area_left': '12',
-    'header_area_width': '42',
+    'header_area_width': '45',
     'header_area_height': '4',
     'pages_to_read': '1',
     'expected_parts': '4',

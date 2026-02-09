@@ -5,6 +5,7 @@ Coordinates all V3 components with improved architecture
 
 import os
 import sys
+import time
 import fitz  # PyMuPDF
 import logging
 import uuid
@@ -34,6 +35,7 @@ from v3.components.header_validator import HeaderValidator
 from v3.components.ocr_pipeline import OCRPipeline
 from v3.components.pdf_splitter import PdfSplitter
 from v3.components.extraction_logger import ExtractionLogger
+from v3.utils.csv_reporter import CSVReporter
 
 logger = logging.getLogger(__name__)
 
@@ -105,8 +107,16 @@ class PDFTextExtractorV3:
             circuit_breaker_threshold=config.circuit_breaker_threshold
         )
         
-        logger.info(f"PDFTextExtractorV3 initialized (v3.0.0)")
+        # Initialize CSV Reporter (NEW in V3.1)
+        self.csv_reporter = CSVReporter(
+            output_folder=config.reports_base_dir,
+            organize_by_date=config.reports_organize_by_date,
+            append_mode=False
+        )
+        
+        logger.info(f"PDFTextExtractorV3 initialized (v3.1.0)")
         logger.info(f"Output structure: {config.output_base_dir}/YYYY/YYYY-MM-DD/files")
+        logger.info(f"CSV Reports: reports/YYYY-MM-DD/")
     
     def process_pdf(self, pdf_path: str) -> dict:
         """
@@ -155,16 +165,43 @@ class PDFTextExtractorV3:
                 page = doc[page_num - 1]  # Convert to 0-based
                 
                 # Extract header from this page
-                header_text = self._extract_header_from_page(
+                start_time = time.time()
+                header_text, ocr_info = self._extract_header_from_page(
                     page,
                     page_num,
                     Path(pdf_path).name,
                     job_id
                 )
+                processing_time_ms = (time.time() - start_time) * 1000
                 
                 if header_text:
                     page_headers.append((page_num - 1, header_text))  # Store 0-based
                     logger.info(f"[JOB {job_id}] Page {page_num} header: '{header_text}'")
+                    
+                    # Record to CSV
+                    self.csv_reporter.add_extraction(
+                        pdf_filename=Path(pdf_path).name,
+                        page_number=page_num,
+                        header_extracted=header_text,
+                        confidence_score=ocr_info.get('confidence_score', 0),
+                        ocr_method=ocr_info.get('method', 'unknown'),
+                        processing_time_ms=processing_time_ms,
+                        render_scale=ocr_info.get('render_scale', 2.0),
+                        status='success' if ocr_info.get('confidence_score', 0) >= 150 else 'low_confidence'
+                    )
+                else:
+                    # Record failed extraction
+                    self.csv_reporter.add_extraction(
+                        pdf_filename=Path(pdf_path).name,
+                        page_number=page_num,
+                        header_extracted='',
+                        confidence_score=0,
+                        ocr_method='failed',
+                        processing_time_ms=processing_time_ms,
+                        render_scale=2.0,
+                        status='error',
+                        error_message='No header extracted'
+                    )
             
             doc.close()
             
@@ -172,9 +209,40 @@ class PDFTextExtractorV3:
             split_results = []
             if self.config.enable_pdf_splitting and page_headers:
                 split_results = self.pdf_splitter.split_pdf(pdf_path, page_headers)
+                
+                # Update CSV with split group info
+                for output_path, header_text, (start_page, end_page) in split_results:
+                    # Find matching records and update split info
+                    for record in self.csv_reporter.pending_records:
+                        if (record.pdf_filename == Path(pdf_path).name and 
+                            start_page <= record.page_number - 1 <= end_page):
+                            record.split_group = header_text
+                            record.output_filename = Path(output_path).name
             
             # End metrics tracking
             metrics = self.metrics_tracker.end_job(job_id)
+            
+            # Write CSV report
+            summary_stats = {
+                'total_pages': total_pages,
+                'headers_extracted': len(page_headers),
+                'split_pdfs_created': len(split_results),
+                'processing_time_seconds': metrics.processing_time_seconds if metrics else 0,
+                'avg_confidence': sum(r.confidence_score for r in self.csv_reporter.pending_records) / len(self.csv_reporter.pending_records) if self.csv_reporter.pending_records else 0
+            }
+            
+            # Filter error/low-confidence records BEFORE flushing
+            error_records = [r for r in self.csv_reporter.pending_records 
+                            if r.status in ['error', 'low_confidence']]
+            
+            # Flush main report
+            csv_path = self.csv_reporter.flush_to_csv(job_id, summary_stats)
+            
+            # Generate error report if needed
+            if csv_path and error_records:
+                error_report = self.csv_reporter.create_error_report(csv_path, error_records)
+                if error_report:
+                    logger.warning(f"Error report generated: {error_report}")
             
             result = {
                 'job_id': job_id,
@@ -184,6 +252,7 @@ class PDFTextExtractorV3:
                 'split_pdfs_created': len(split_results),
                 'split_results': split_results,
                 'metrics': metrics.to_dict() if metrics else None,
+                'csv_report': str(csv_path) if csv_path else None,
                 'success': True
             }
             
@@ -192,6 +261,8 @@ class PDFTextExtractorV3:
             logger.info(f"  Split PDFs created: {len(split_results)}")
             if metrics:
                 logger.info(f"  Processing time: {metrics.processing_time_seconds:.2f}s")
+            if csv_path:
+                logger.info(f"  CSV Report: {csv_path}")
             
             return result
         
@@ -213,7 +284,7 @@ class PDFTextExtractorV3:
         page_num: int,
         filename: str,
         job_id: str
-    ) -> str:
+    ) -> Tuple[str, dict]:
         """
         Extract header text from a single page
         
@@ -224,8 +295,14 @@ class PDFTextExtractorV3:
             job_id: Job ID for metrics
         
         Returns:
-            str: Extracted header text
+            Tuple of (header_text, ocr_info_dict)
         """
+        ocr_info = {
+            'confidence_score': 0,
+            'method': 'unknown',
+            'render_scale': 2.0
+        }
+        
         try:
             # Calculate header region
             page_rect = page.rect
@@ -246,7 +323,9 @@ class PDFTextExtractorV3:
                 score, corrected = self.validator.validate_and_score(direct_text)
                 if score > 0:
                     logger.info(f"[DIRECT] Got '{corrected}' (score: {score})")
-                    return corrected
+                    ocr_info['confidence_score'] = score
+                    ocr_info['method'] = 'direct'
+                    return corrected, ocr_info
             
             # OCR extraction with adaptive rendering
             context = OCRContext(
@@ -259,6 +338,14 @@ class PDFTextExtractorV3:
                 page, rect, context
             )
             
+            # Extract OCR info
+            if text:
+                score, _ = self.validator.validate_and_score(text)
+                ocr_info['confidence_score'] = score
+                ocr_info['method'] = list(method_results.keys())[0] if method_results else 'unknown'
+                # Get render scale from context (default to 2.0)
+                ocr_info['render_scale'] = 2.0  # Would need to track this from adaptive rendering
+            
             # Log to API
             if self.config.enable_api_logging:
                 self.extraction_logger.log_extraction(
@@ -270,7 +357,7 @@ class PDFTextExtractorV3:
                     status="success"
                 )
             
-            return text
+            return text, ocr_info
         
         except Exception as e:
             logger.error(f"Error extracting header from page {page_num}: {e}")
@@ -285,7 +372,7 @@ class PDFTextExtractorV3:
                     error_message=str(e)
                 )
             
-            return ""
+            return "", ocr_info
     
     def shutdown(self):
         """Gracefully shutdown extractor"""
