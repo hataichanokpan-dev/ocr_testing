@@ -179,6 +179,8 @@ class PdfSplitter:
         if not page_headers:
             return []
         
+        logger.debug(f"Detecting groups from {len(page_headers)} page headers")
+        
         groups = []
         current_start = page_headers[0][0]
         current_header = page_headers[0][1]
@@ -198,6 +200,8 @@ class PdfSplitter:
             else:
                 # New group - save previous
                 best_header = self._select_best_header(current_headers)
+                page_count = page_headers[i - 1][0] - current_start + 1
+                logger.debug(f"Group: '{best_header}' pages {current_start+1}-{page_headers[i - 1][0]+1} ({page_count} pages)")
                 groups.append((current_start, page_headers[i - 1][0], best_header))
                 
                 # Start new group
@@ -207,20 +211,238 @@ class PdfSplitter:
         
         # Add last group
         best_header = self._select_best_header(current_headers)
+        page_count = page_headers[-1][0] - current_start + 1
+        logger.debug(f"Group: '{best_header}' pages {current_start+1}-{page_headers[-1][0]+1} ({page_count} pages)")
         groups.append((current_start, page_headers[-1][0], best_header))
         
-        # Filter by min_pages_per_split
-        if self.config.min_pages_per_split > 1:
+        logger.info(f"Detected {len(groups)} header groups (before context correction)")
+        
+        # Apply context-based correction for likely OCR errors
+        groups = self._apply_context_correction(groups)
+        logger.info(f"After context correction: {len(groups)} header groups")
+        
+        # Filter by min_pages_per_split (skip if min is 0)
+        if self.config.min_pages_per_split > 0:
             filtered = []
             for start, end, header in groups:
                 page_count = end - start + 1
                 if page_count >= self.config.min_pages_per_split:
                     filtered.append((start, end, header))
                 else:
-                    logger.debug(f"Skipping group with {page_count} pages (min: {self.config.min_pages_per_split})")
-            groups = filtered
+                    logger.warning(f"Skipping group '{header}' with {page_count} pages (pages {start+1}-{end+1}, min: {self.config.min_pages_per_split})")
+            logger.info(f"After filtering: {len(filtered)} groups (removed {len(groups) - len(filtered)})")
+            return filtered
+        else:
+            logger.debug(f"No filtering (min=0), returning all {len(groups)} groups")
+            return groups
+    
+    def _apply_context_correction(
+        self,
+        groups: List[Tuple[int, int, str]]
+    ) -> List[Tuple[int, int, str]]:
+        """
+        Apply context-based correction to fix likely OCR errors
         
-        return groups
+        Strategy:
+        1. Find single-page groups surrounded by multi-page groups
+        2. Check if the single-page header is similar to neighbors (serial number differs by 1-2 chars)
+        3. Merge with the most similar neighbor
+        
+        Args:
+            groups: List of (start_page, end_page, header_text) tuples
+        
+        Returns:
+            Corrected list of groups (merged where OCR errors detected)
+        """
+        if len(groups) <= 1:
+            return groups
+        
+        corrected = []
+        i = 0
+        
+        while i < len(groups):
+            current_start, current_end, current_header = groups[i]
+            current_pages = current_end - current_start + 1
+            
+            # Check if this is a single-page group
+            if current_pages == 1 and i > 0:
+                # Compare with previous group
+                prev_start, prev_end, prev_header = corrected[-1]
+                
+                # Check if headers are similar (likely OCR error)
+                if self._is_likely_ocr_error(current_header, prev_header):
+                    # Merge with previous group
+                    logger.info(
+                        f"Context correction: Merging page {current_start+1} "
+                        f"('{current_header}') with previous group "
+                        f"(pages {prev_start+1}-{prev_end+1}, '{prev_header}') - likely OCR error"
+                    )
+                    # Update last group to extend range
+                    corrected[-1] = (prev_start, current_end, prev_header)
+                    i += 1
+                    continue
+            
+            # No correction needed, add as-is
+            corrected.append((current_start, current_end, current_header))
+            i += 1
+        
+        return corrected
+    
+    def _is_likely_ocr_error(self, header1: str, header2: str) -> bool:
+        """
+        Check if two headers differ in a way that suggests OCR error
+        
+        Criteria for likely OCR error:
+        1. Same prefix structure (B-XX-XXX-)
+        2. Serial numbers differ by only 1-3 characters
+        3. Overall similarity > 70%
+        
+        Special cases handled:
+        - Missing separators (B-HK-FI4-S18008633 vs B-HK-FL4518008633)
+        - Extra/missing characters in serial
+        
+        Args:
+            header1: First header
+            header2: Second header
+        
+        Returns:
+            bool: True if likely an OCR error
+        """
+        # Quick check: if too different in length, not OCR error (unless missing separator)
+        if abs(len(header1) - len(header2)) > 5:
+            return False
+        
+        # Extract all digit sequences (potential serial numbers)
+        import re
+        digits1 = re.findall(r'\d+', header1)
+        digits2 = re.findall(r'\d+', header2)
+        
+        # Find longest digit sequence (likely the serial number)
+        longest_digits1 = max(digits1, key=len) if digits1 else ""
+        longest_digits2 = max(digits2, key=len) if digits2 else ""
+        
+        # If serial numbers are identical or very similar, likely OCR error
+        if longest_digits1 and longest_digits2:
+            if len(longest_digits1) >= 7 and len(longest_digits2) >= 7:
+                # Both have substantial serial numbers
+                if longest_digits1 == longest_digits2:
+                    # Exact match on serial = definitely OCR error in other parts
+                    logger.debug(
+                        f"Likely OCR error: serial numbers identical '{longest_digits1}' "
+                        f"in '{header1}' vs '{header2}'"
+                    )
+                    return True
+                
+                # Check if one is substring of other (e.g., "18008633" vs "180086337")
+                if longest_digits1 in longest_digits2 or longest_digits2 in longest_digits1:
+                    if abs(len(longest_digits1) - len(longest_digits2)) <= 2:
+                        logger.debug(
+                            f"Likely OCR error: serial numbers very similar "
+                            f"'{longest_digits1}' vs '{longest_digits2}'"
+                        )
+                        return True
+                
+                # Check edit distance on serial numbers
+                serial_diff = self._count_char_differences(longest_digits1, longest_digits2)
+                max_serial_len = max(len(longest_digits1), len(longest_digits2))
+                if serial_diff <= 2 and serial_diff < max_serial_len * 0.25:
+                    logger.debug(
+                        f"Likely OCR error: serial numbers differ by {serial_diff} chars "
+                        f"'{longest_digits1}' vs '{longest_digits2}'"
+                    )
+                    return True
+        
+        # Fallback to original structural check
+        parts1 = header1.split(self.config.expected_separator)
+        parts2 = header2.split(self.config.expected_separator)
+        
+        # Must have same number of parts (or differ by 1 due to missing separator)
+        if abs(len(parts1) - len(parts2)) > 1:
+            return False
+        
+        # Check if prefix parts are same (B-XX-XXX)
+        if len(parts1) >= 3 and len(parts2) >= 3:
+            # Prefix must match
+            if parts1[0] != parts2[0]:
+                return False
+            
+            # Country should match (or be close)
+            if parts1[1] != parts2[1] and not self._strings_similar(parts1[1], parts2[1], 0.7):
+                return False
+            
+            # Code can differ slightly (FI4 vs FL45)
+            if not self._strings_similar(parts1[2], parts2[2], 0.5):
+                # Allow if rest of header is very similar
+                return False
+            
+            # Check serial number (last part)
+            serial1 = parts1[-1] if len(parts1) > 3 else ""
+            serial2 = parts2[-1] if len(parts2) > 3 else ""
+            
+            # Extract digits from serial
+            serial_digits1 = ''.join(c for c in serial1 if c.isdigit())
+            serial_digits2 = ''.join(c for c in serial2 if c.isdigit())
+            
+            if not serial_digits1 or not serial_digits2:
+                return False
+            
+            # Count differing digits
+            max_len = max(len(serial_digits1), len(serial_digits2))
+            if max_len == 0:
+                return False
+            
+            # Calculate Levenshtein-like distance
+            diff_count = self._count_char_differences(serial_digits1, serial_digits2)
+            
+            # If digits differ by 1-3 chars and are mostly same, likely OCR error
+            if diff_count <= 3 and diff_count < max_len * 0.3:
+                logger.debug(
+                    f"Likely OCR error detected: '{header1}' vs '{header2}' "
+                    f"(serial digits: '{serial_digits1}' vs '{serial_digits2}', {diff_count} differences)"
+                )
+                return True
+        
+        return False
+    
+    def _strings_similar(self, s1: str, s2: str, threshold: float = 0.7) -> bool:
+        """Check if two strings are similar above threshold"""
+        if not s1 or not s2:
+            return False
+        
+        max_len = max(len(s1), len(s2))
+        if max_len == 0:
+            return True
+        
+        diff = self._count_char_differences(s1, s2)
+        similarity = 1.0 - (diff / max_len)
+        return similarity >= threshold
+    
+    def _count_char_differences(self, s1: str, s2: str) -> int:
+        """Count character differences between two strings (simple Levenshtein)"""
+        len1, len2 = len(s1), len(s2)
+        
+        # Create distance matrix
+        dp = [[0] * (len2 + 1) for _ in range(len1 + 1)]
+        
+        # Initialize
+        for i in range(len1 + 1):
+            dp[i][0] = i
+        for j in range(len2 + 1):
+            dp[0][j] = j
+        
+        # Fill matrix
+        for i in range(1, len1 + 1):
+            for j in range(1, len2 + 1):
+                if s1[i-1] == s2[j-1]:
+                    dp[i][j] = dp[i-1][j-1]
+                else:
+                    dp[i][j] = 1 + min(
+                        dp[i-1][j],      # deletion
+                        dp[i][j-1],      # insertion
+                        dp[i-1][j-1]     # substitution
+                    )
+        
+        return dp[len1][len2]
     
     def _select_best_header(self, headers: List[str]) -> str:
         """Select the best header from a list of similar headers"""

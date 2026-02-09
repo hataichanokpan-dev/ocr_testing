@@ -183,7 +183,8 @@ class PDFTextExtractorV3:
                 'headers_extracted': len(page_headers),
                 'split_pdfs_created': len(split_results),
                 'split_results': split_results,
-                'metrics': metrics.to_dict() if metrics else None
+                'metrics': metrics.to_dict() if metrics else None,
+                'success': True
             }
             
             logger.info(f"[JOB {job_id}] Processing complete!")
@@ -313,8 +314,12 @@ def main():
     # Create extractor
     extractor = PDFTextExtractorV3(config)
     
+    # Get PDF path from command line or use default
+    import sys
+    pdf_path = sys.argv[1] if len(sys.argv) > 1 else 'test_input/sample.pdf'
+    
     # Process a PDF
-    result = extractor.process_pdf('test_input/sample.pdf')
+    result = extractor.process_pdf(pdf_path)
     
     print(f"\nProcessing Result:")
     print(f"  Job ID: {result['job_id']}")

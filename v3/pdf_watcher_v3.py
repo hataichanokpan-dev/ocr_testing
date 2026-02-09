@@ -66,23 +66,75 @@ class PDFHandler(FileSystemEventHandler):
         if event.src_path in self.processing:
             return
         
-        # Wait for file to be fully written
-        time.sleep(2)
-        
         try:
             self.processing.add(event.src_path)
             logger.info(f"Detected new PDF: {event.src_path}")
             
-            # Process PDF
-            self.extractor.process_pdf(event.src_path)
+            # Wait and validate file is complete and not corrupted
+            if not self._wait_for_file_ready(event.src_path):
+                logger.warning(f"File not ready or corrupted, skipping: {event.src_path}")
+                return
             
-            logger.info(f"Successfully processed: {event.src_path}")
+            # Process PDF
+            result = self.extractor.process_pdf(event.src_path)
+            
+            # Log actual result
+            if result.get('success', True) and not result.get('error'):
+                logger.info(f"Successfully processed: {event.src_path} - "
+                           f"Headers: {result.get('headers_extracted', 0)}, "
+                           f"Splits: {result.get('split_pdfs_created', 0)}")
+            else:
+                logger.error(f"Failed to process: {event.src_path} - {result.get('error', 'Unknown error')}")
         
         except Exception as e:
             logger.error(f"Error processing {event.src_path}: {e}", exc_info=True)
         
         finally:
             self.processing.discard(event.src_path)
+    
+    def _wait_for_file_ready(self, filepath: str, max_attempts: int = 5) -> bool:
+        """Wait for file to be fully written and validate it's not corrupted"""
+        import os
+        
+        for attempt in range(max_attempts):
+            try:
+                # Wait before checking
+                time.sleep(2 if attempt == 0 else 1)
+                
+                # Check file exists and has size
+                if not os.path.exists(filepath):
+                    logger.warning(f"File disappeared: {filepath}")
+                    return False
+                
+                file_size = os.path.getsize(filepath)
+                if file_size == 0:
+                    logger.warning(f"File is empty (attempt {attempt + 1}/{max_attempts})")
+                    continue
+                
+                # Try to open with fitz to validate
+                try:
+                    import fitz
+                    doc = fitz.open(filepath)
+                    page_count = len(doc)
+                    doc.close()
+                    
+                    if page_count > 0:
+                        logger.debug(f"File ready: {filepath} ({file_size} bytes, {page_count} pages)")
+                        return True
+                    else:
+                        logger.warning(f"PDF has no pages (attempt {attempt + 1}/{max_attempts})")
+                        continue
+                
+                except Exception as e:
+                    logger.warning(f"File not ready or corrupted (attempt {attempt + 1}/{max_attempts}): {e}")
+                    continue
+            
+            except Exception as e:
+                logger.error(f"Error checking file readiness: {e}")
+                continue
+        
+        logger.error(f"File failed validation after {max_attempts} attempts: {filepath}")
+        return False
 
 
 def main():
@@ -122,9 +174,10 @@ def main():
         while True:
             time.sleep(60)
             
-            # Export metrics every hour
-            if int(time.time()) % 3600 < 60:
+            # Export metrics every 6 hours (reduce log spam)
+            if int(time.time()) % 21600 < 60:
                 metrics.export_to_json(config.metrics_export_path)
+                logger.debug("Metrics exported (6-hour interval)")
     
     except KeyboardInterrupt:
         logger.info("Shutdown signal received...")
