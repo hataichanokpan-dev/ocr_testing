@@ -173,6 +173,7 @@ class PDFTextExtractorV3:
                     job_id
                 )
                 processing_time_ms = (time.time() - start_time) * 1000
+                self.metrics_tracker.record_page_processed(job_id, 1)
                 
                 if header_text:
                     page_headers.append((page_num - 1, header_text))  # Store 0-based

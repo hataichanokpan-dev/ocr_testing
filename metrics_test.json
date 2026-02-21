@@ -1,0 +1,42 @@
+{
+  "format_version": "2.0",
+  "summary": {
+    "total_jobs": 1,
+    "active_jobs": 0,
+    "total_pages_processed": 8,
+    "avg_processing_time_seconds": 0.01,
+    "avg_processing_per_page_seconds": 0.001,
+    "total_processing_time_seconds": 0.01,
+    "total_ocr_attempts": 2,
+    "total_ocr_successful": 2,
+    "ocr_success_rate": 100.0,
+    "total_api_calls": 0,
+    "total_api_success": 0,
+    "api_success_rate": 0.0,
+    "fastest_job": 0.010605335235595703,
+    "slowest_job": 0.010605335235595703
+  },
+  "timestamp": "2026-02-21T21:55:07.274296",
+  "completed_jobs": [
+    {
+      "job_id": "job1",
+      "filename": "a.pdf",
+      "started_at": "2026-02-21T21:55:07.263691",
+      "completed_at": "2026-02-21T21:55:07.274297",
+      "processing_time_seconds": 0.01,
+      "total_pages": 10,
+      "processed_pages": 8,
+      "avg_time_per_page_seconds": 0.001,
+      "ocr_attempts": 2,
+      "ocr_successful": 2,
+      "success_rate": 100.0,
+      "best_score": 130,
+      "api_calls": 0,
+      "api_success": 0,
+      "api_failures": 0,
+      "api_success_rate": 0.0,
+      "errors_count": 0,
+      "errors": []
+    }
+  ]
+}
