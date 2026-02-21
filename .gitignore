@@ -26,6 +26,7 @@ wheels/
 # Debug files
 debug_*.png
 debug_*.jpg
+*.png
 
 # Temporary files
 *.tmp
@@ -40,6 +41,8 @@ output_*.pdf
 output*.pdf
 input*.pdf
 example_*.pdf
+*.pdf
+*.xlsx
 
 # Log files
 *.log

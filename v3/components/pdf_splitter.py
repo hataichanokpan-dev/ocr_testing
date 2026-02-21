@@ -6,6 +6,7 @@ Extracted from V2 with improvements
 import fitz  # PyMuPDF
 import os
 import re
+import tempfile
 import time
 import logging
 from pathlib import Path
@@ -510,10 +511,18 @@ class PdfSplitter:
             # Save to temp file first, then atomically replace target to avoid
             # permission issues when destination file already exists/locked.
             output_path.parent.mkdir(parents=True, exist_ok=True)
-            temp_path = output_path.parent / f".{output_path.stem}_{int(time.time() * 1000)}.tmp.pdf"
+            fd, raw_temp_path = tempfile.mkstemp(
+                suffix=".tmp.pdf",
+                prefix=f"{output_path.stem}_",
+                dir=str(output_path.parent)
+            )
+            os.close(fd)
+            temp_path = Path(raw_temp_path)
             new_doc.save(str(temp_path))
             new_doc.close()
             new_doc = None
+            if not temp_path.exists():
+                raise FileNotFoundError(f"Temp file not created: {temp_path}")
 
             target = output_path
             retry_delays = [0.0, 0.2, 0.6]
@@ -525,12 +534,29 @@ class PdfSplitter:
                     return target
                 except PermissionError:
                     continue
+                except FileNotFoundError:
+                    # Temp file disappeared unexpectedly (e.g. external lock/cleanup).
+                    # Break to fallback path regeneration.
+                    break
 
             # Final fallback: write to alternate filename if target is locked
             fallback_target = self.output_organizer.get_unique_output_path(
                 f"{output_path.stem}_locked{output_path.suffix}"
             )
-            os.replace(str(temp_path), str(fallback_target))
+            if temp_path.exists():
+                os.replace(str(temp_path), str(fallback_target))
+            else:
+                # Regenerate subset directly to fallback path as a last resort.
+                regen_doc = fitz.open()
+                try:
+                    regen_doc.insert_pdf(
+                        source_doc,
+                        from_page=start_page,
+                        to_page=end_page
+                    )
+                    regen_doc.save(str(fallback_target))
+                finally:
+                    regen_doc.close()
             logger.warning(
                 f"Target file was locked, saved to fallback path: {fallback_target.name}"
             )
