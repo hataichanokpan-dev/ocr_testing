@@ -120,6 +120,15 @@ class ExtractionConfig:
     # Metrics tracking (NEW in V3)
     enable_metrics_tracking: bool = True
     metrics_export_path: str = 'metrics.json'
+
+    # PaddleOCR Fallback Configuration (V3.2)
+    enable_paddleocr_fallback: bool = True
+    tesseract_confidence_threshold: float = 85.0
+    enable_pattern_check: bool = True
+    header_pattern: str = r'^[A-Z]-[A-Z]{1,2}-[A-Z0-9]{2,4}-[SR][0-9]{6,8}$'
+    ambiguous_characters: str = 'S:5,B:8,P:F,O:0,I:1,Z:2'
+    character_whitelist: str = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-'
+    enable_ensemble_voting: bool = True
     
     def __post_init__(self):
         """Validate configuration after initialization"""
@@ -280,6 +289,15 @@ class ConfigManager:
             # Metrics
             enable_metrics_tracking=settings.getboolean('enable_metrics_tracking', True),
             metrics_export_path=settings.get('metrics_export_path', 'metrics.json'),
+
+            # PaddleOCR Fallback (V3.2)
+            enable_paddleocr_fallback=settings.getboolean('enable_paddleocr_fallback', True),
+            tesseract_confidence_threshold=settings.getfloat('tesseract_confidence_threshold', 85.0),
+            enable_pattern_check=settings.getboolean('enable_pattern_check', True),
+            header_pattern=settings.get('header_pattern', r'^[A-Z]-[A-Z]{1,2}-[A-Z0-9]{2,4}-[SR][0-9]{6,8}$'),
+            ambiguous_characters=settings.get('ambiguous_characters', 'S:5,B:8,P:F,O:0,I:1,Z:2'),
+            character_whitelist=settings.get('character_whitelist', 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-'),
+            enable_ensemble_voting=settings.getboolean('enable_ensemble_voting', True),
         )
         
         logger.info(f"Configuration loaded from: {config_path}")

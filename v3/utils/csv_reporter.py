@@ -10,6 +10,8 @@ from datetime import datetime
 from typing import List, Dict, Optional
 from dataclasses import dataclass, asdict
 
+logger = logging.getLogger(__name__)
+
 try:
     from openpyxl import Workbook
     from openpyxl.styles import Font, PatternFill, Alignment
@@ -18,8 +20,6 @@ try:
 except ImportError:
     EXCEL_AVAILABLE = False
     logger.warning("openpyxl not available - Excel reports disabled")
-
-logger = logging.getLogger(__name__)
 
 
 @dataclass

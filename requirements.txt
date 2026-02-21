@@ -10,17 +10,22 @@ PyMuPDF==1.23.8
 # Image processing for OCR
 Pillow==10.1.0
 
-# OCR engine
+# OCR engine (Tesseract)
 pytesseract==0.3.10
 
 # Image processing with OpenCV
 opencv-python==4.8.1.78
 
 # Numpy for image processing
-numpy==1.24.3
+numpy==1.26.4
 
 # HTTP requests for API logging
 requests==2.31.0
 
 # Excel report generation
 openpyxl==3.1.2
+
+# PaddleOCR - Fallback OCR engine for improved accuracy
+# CPU-only version (no GPU required)
+paddlepaddle==3.1.1
+paddleocr==3.2.0 

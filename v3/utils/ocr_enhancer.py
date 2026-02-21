@@ -340,7 +340,14 @@ class MultiEngineOCR:
         # Try PaddleOCR
         if self.use_paddleocr and self.paddleocr_reader:
             try:
-                paddleocr_results = self.paddleocr_reader.ocr(image, cls=True)
+                try:
+                    paddleocr_results = self.paddleocr_reader.ocr(image, cls=True)
+                except TypeError as e:
+                    if "unexpected keyword argument 'cls'" in str(e):
+                        logger.debug("[PADDLEOCR] API does not accept `cls`; retrying without it")
+                        paddleocr_results = self.paddleocr_reader.ocr(image)
+                    else:
+                        raise
                 if paddleocr_results and paddleocr_results[0]:
                     # Extract text from results
                     paddleocr_text = ' '.join([line[1][0] for line in paddleocr_results[0]])
