@@ -45,6 +45,10 @@ class ExtractionConfig:
     pattern_serial_min: int = 7
     pattern_serial_max: int = 10
     pattern_serial_allowed_prefixes: List[str] = field(default_factory=lambda: ['S', 'R'])
+    serial_prefix_required: bool = True
+    serial_digits_exact: int = 8
+    invalid_serial_score_cap: int = 89
+    serial_close_match_threshold: float = 0.85
     
     # Performance settings
     enable_parallel_processing: bool = True
@@ -126,7 +130,7 @@ class ExtractionConfig:
     enable_paddleocr_fallback: bool = True
     tesseract_confidence_threshold: float = 85.0
     enable_pattern_check: bool = True
-    header_pattern: str = r'^[A-Z](?:-[A-Z0-9]{1,8}){2,3}$'
+    header_pattern: str = r'^[A-Z](?:-[A-Z0-9]{1,8}){1,2}-[SR][0-9]{7,8}$'
     ambiguous_characters: str = 'S:5,B:8,P:F,O:0,I:1,Z:2'
     character_whitelist: str = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-'
     enable_ensemble_voting: bool = True
@@ -215,6 +219,10 @@ class ConfigManager:
             pattern_serial_min=settings.getint('pattern_serial_min', 7),
             pattern_serial_max=settings.getint('pattern_serial_max', 10),
             pattern_serial_allowed_prefixes=allowed_prefixes,
+            serial_prefix_required=settings.getboolean('serial_prefix_required', True),
+            serial_digits_exact=settings.getint('serial_digits_exact', 8),
+            invalid_serial_score_cap=settings.getint('invalid_serial_score_cap', 89),
+            serial_close_match_threshold=settings.getfloat('serial_close_match_threshold', 0.85),
             
             # Performance
             enable_parallel_processing=settings.getboolean('enable_parallel_processing', True),
@@ -296,7 +304,7 @@ class ConfigManager:
             enable_paddleocr_fallback=settings.getboolean('enable_paddleocr_fallback', True),
             tesseract_confidence_threshold=settings.getfloat('tesseract_confidence_threshold', 85.0),
             enable_pattern_check=settings.getboolean('enable_pattern_check', True),
-            header_pattern=settings.get('header_pattern', r'^[A-Z](?:-[A-Z0-9]{1,8}){2,3}$'),
+            header_pattern=settings.get('header_pattern', r'^[A-Z](?:-[A-Z0-9]{1,8}){1,2}-[SR][0-9]{7,8}$'),
             ambiguous_characters=settings.get('ambiguous_characters', 'S:5,B:8,P:F,O:0,I:1,Z:2'),
             character_whitelist=settings.get('character_whitelist', 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-'),
             enable_ensemble_voting=settings.getboolean('enable_ensemble_voting', True),

@@ -34,7 +34,7 @@ class FallbackChecker:
         self,
         config=None,
         confidence_threshold: float = 85.0,
-        header_pattern: str = r'^[A-Z](?:-[A-Z0-9]{1,8}){2,3}$',
+        header_pattern: str = r'^[A-Z](?:-[A-Z0-9]{1,8}){1,2}-[SR][0-9]{7,8}$',
         character_whitelist: str = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-',
         ambiguous_characters: str = 'S:5,B:8,P:F,O:0,I:1,Z:2',
         enable_pattern_check: bool = True
@@ -243,7 +243,7 @@ def create_fallback_checker_from_config(config) -> FallbackChecker:
         return FallbackChecker(
             confidence_threshold=float(section.get('tesseract_confidence_threshold', 85.0)),
             header_pattern=section.get('header_pattern',
-                                       r'^[A-Z](?:-[A-Z0-9]{1,8}){2,3}$'),
+                                       r'^[A-Z](?:-[A-Z0-9]{1,8}){1,2}-[SR][0-9]{7,8}$'),
             character_whitelist=section.get('character_whitelist',
                                             'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-'),
             ambiguous_characters=section.get('ambiguous_characters', 'S:5,B:8,P:F,O:0,I:1,Z:2'),

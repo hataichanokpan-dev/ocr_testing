@@ -322,11 +322,18 @@ class PDFTextExtractorV3:
             direct_text = page.get_text("text", clip=rect).strip()
             if direct_text:
                 score, corrected = self.validator.validate_and_score(direct_text)
-                if score > 0:
+                strict_valid = self.validator.is_strict_header(
+                    corrected if corrected else direct_text
+                )
+                if strict_valid and score > 0:
                     logger.info(f"[DIRECT] Got '{corrected}' (score: {score})")
                     ocr_info['confidence_score'] = score
                     ocr_info['method'] = 'direct'
                     return corrected, ocr_info
+                logger.debug(
+                    f"[DIRECT] Rejected non-strict header '{corrected}' "
+                    f"(score: {score}, strict_valid: {strict_valid}); fallback to OCR"
+                )
             
             # OCR extraction with adaptive rendering
             context = OCRContext(

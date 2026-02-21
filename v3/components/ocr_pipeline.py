@@ -7,6 +7,8 @@ Adds PaddleOCR fallback when Tesseract conditions are not met
 import logging
 import os
 import shutil
+import time
+from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Dict, Tuple, List, Optional
 from collections import Counter, defaultdict
@@ -62,6 +64,10 @@ class OCRPipeline:
         self._enable_paddleocr_fallback = config.enable_paddleocr_fallback
         self._enable_ensemble_voting = config.enable_ensemble_voting
         self._tesseract_available = self._configure_tesseract()
+        self._paddle_empty_streak = 0
+        self._paddle_empty_limit = 3
+        self._paddle_cooldown_seconds = 600
+        self._paddle_disabled_until = 0.0
 
         logger.info("OCR Pipeline V3.2 initialized (native V3 methods + PaddleOCR fallback)")
 
@@ -226,6 +232,7 @@ class OCRPipeline:
         best_score = -1
         all_method_results = {}
         best_freq_ratio = 0.0
+        scale_candidates: List[Dict] = []
         
         for scale in scales:
             logger.info(f"[OCR] Trying scale {scale}x (page {context.page_num})")
@@ -252,8 +259,22 @@ class OCRPipeline:
             
             # Score the result
             score, corrected_text = self.validator.validate_and_score(text)
+            chosen_text = corrected_text if corrected_text else text
+            strict_valid = self.validator.is_strict_header(chosen_text)
             
-            logger.info(f"[OCR] Scale {scale}x result: '{corrected_text}' (score: {score})")
+            logger.info(
+                f"[OCR] Scale {scale}x result: '{corrected_text}' "
+                f"(score: {score}, strict_valid: {strict_valid})"
+            )
+
+            scale_candidates.append({
+                "text": chosen_text,
+                "score": score,
+                "strict_valid": strict_valid,
+                "freq_ratio": freq_ratio,
+                "method_results": method_results,
+                "scale": scale,
+            })
             
             # Update if better
             if score > best_score:
@@ -271,14 +292,27 @@ class OCRPipeline:
                 )
             
             # Early exit if score is excellent
-            if score >= self.config.early_exit_score:
+            if strict_valid and score >= self.config.early_exit_score:
                 logger.info(f"[OCR] Early exit: excellent score {score}")
                 break
 
             # Don't try higher scales if score is already good
-            if score >= self.config.score_threshold_for_escalation:
+            if strict_valid and score >= self.config.score_threshold_for_escalation:
                 logger.info(f"[OCR] Good score {score}, no need for higher scale")
                 break
+
+        # Cross-scale voting: when several scales produce close/tied candidates,
+        # prefer the one most consistently repeated/similar across scales.
+        if scale_candidates:
+            voted = self._select_cross_scale_result(scale_candidates)
+            best_text = voted["text"]
+            best_score = voted["score"]
+            all_method_results = voted["method_results"]
+            best_freq_ratio = voted["freq_ratio"]
+            logger.info(
+                f"[OCR] Cross-scale vote selected: '{best_text}' "
+                f"(score: {best_score}, strict_valid: {voted['strict_valid']}, scale: {voted['scale']}x)"
+            )
 
         # Check for PaddleOCR fallback
         if self._enable_paddleocr_fallback:
@@ -294,6 +328,79 @@ class OCRPipeline:
 
         logger.info(f"[OCR] Final result: '{best_text}' (score: {best_score})")
         return best_text, all_method_results, best_freq_ratio
+
+    @staticmethod
+    def _select_cross_scale_result(candidates: List[Dict]) -> Dict:
+        """
+        Select final result across scales.
+
+        Ranking priorities:
+        1) strict-valid candidates
+        2) exact repeat count across scales
+        3) similarity support across scales
+        4) higher score / higher within-scale voting ratio
+        5) higher scale as final tie-breaker
+        """
+        if not candidates:
+            return {
+                "text": "",
+                "score": -1,
+                "strict_valid": False,
+                "freq_ratio": 0.0,
+                "method_results": {},
+                "scale": 0.0,
+            }
+
+        prepared: List[Dict] = []
+        for idx, candidate in enumerate(candidates):
+            text = str(candidate.get("text", "") or "").strip()
+            strict_valid = bool(candidate.get("strict_valid", False))
+            score = int(candidate.get("score", -1))
+            freq_ratio = float(candidate.get("freq_ratio", 0.0))
+            scale = float(candidate.get("scale", 0.0))
+
+            exact_count = 0
+            similarity_support = 0
+            similarity_sum = 0.0
+            for other in candidates:
+                other_text = str(other.get("text", "") or "").strip()
+                if not text or not other_text:
+                    continue
+                if text == other_text:
+                    exact_count += 1
+                sim = SequenceMatcher(None, text, other_text).ratio()
+                similarity_sum += sim
+                if sim >= 0.92:
+                    similarity_support += 1
+
+            prepared.append({
+                "idx": idx,
+                "text": text,
+                "score": score,
+                "strict_valid": strict_valid,
+                "freq_ratio": freq_ratio,
+                "method_results": candidate.get("method_results", {}),
+                "scale": scale,
+                "exact_count": exact_count,
+                "similarity_support": similarity_support,
+                "similarity_sum": similarity_sum,
+            })
+
+        prepared.sort(
+            key=lambda x: (
+                x["strict_valid"],
+                x["exact_count"],
+                x["similarity_support"],
+                x["score"],
+                x["freq_ratio"],
+                x["similarity_sum"],
+                x["scale"],
+                -len(x["text"]),
+                -x["idx"],
+            ),
+            reverse=True,
+        )
+        return prepared[0]
     
     def _run_ocr_methods(
         self,
@@ -350,17 +457,21 @@ class OCRPipeline:
                     attempts += 1
 
                     if text:
+                        strict_valid = self.validator.is_strict_header(text)
                         results.append(text)
                         text_confidences[text].append(confidence)
                         method_results[method_key] = {
                             "text": text,
                             "score": score,
                             "confidence": confidence,
+                            "strict_valid": strict_valid,
                             "psm_mode": psm_mode,
                         }
 
                         # Early exit only when structure score + OCR confidence are both strong.
                         if (
+                            strict_valid
+                            and
                             score >= self.config.early_exit_score
                             and confidence >= self.config.tesseract_confidence_threshold
                         ):
@@ -374,6 +485,7 @@ class OCRPipeline:
                             "text": "",
                             "score": -1,
                             "confidence": confidence,
+                            "strict_valid": False,
                             "psm_mode": psm_mode,
                         }
 
@@ -392,18 +504,20 @@ class OCRPipeline:
                 freq = frequency[text]
                 conf_values = text_confidences.get(text, [])
                 avg_conf = sum(conf_values) / len(conf_values) if conf_values else 0.0
-                weighted = (score * 0.7) + (avg_conf * 0.3)
+                strict_valid = self.validator.is_strict_header(corrected if corrected else text)
+                weighted = (score * 0.7) + (avg_conf * 0.3) + (20.0 if strict_valid else 0.0)
                 scored_results.append({
                     "text": text,
                     "corrected": corrected,
                     "score": score,
                     "frequency": freq,
                     "avg_confidence": avg_conf,
+                    "strict_valid": strict_valid,
                     "weighted": weighted,
                 })
 
             scored_results.sort(
-                key=lambda x: (x["weighted"], x["score"], x["frequency"], x["avg_confidence"]),
+                key=lambda x: (x["strict_valid"], x["weighted"], x["score"], x["frequency"], x["avg_confidence"]),
                 reverse=True,
             )
 
@@ -634,15 +748,32 @@ class OCRPipeline:
         if not self._enable_paddleocr_fallback:
             return tesseract_text, tesseract_method_results, 0.0, "disabled"
 
+        now = time.time()
+        if now < self._paddle_disabled_until:
+            remaining = int(self._paddle_disabled_until - now)
+            return (
+                tesseract_text,
+                tesseract_method_results,
+                0.0,
+                f"paddle_cooldown({remaining}s)",
+            )
+
         # If validator score is already good/excellent, skip fallback.
         # This prevents unnecessary PaddleOCR calls when Tesseract output is usable
         # but fails a strict regex profile.
-        base_score, _ = self.validator.validate_and_score(tesseract_text)
-        if base_score >= self.config.score_threshold_for_escalation:
+        base_score, normalized = self.validator.validate_and_score(tesseract_text)
+        base_text = normalized if normalized else tesseract_text
+        base_strict = self.validator.is_strict_header(base_text)
+        if base_strict and base_score >= self.config.score_threshold_for_escalation:
             logger.debug(
                 f"[OCR] Skip PaddleOCR fallback: validator score already good ({base_score})"
             )
-            return tesseract_text, tesseract_method_results, 0.0, f"not_needed(score={base_score})"
+            return (
+                tesseract_text,
+                tesseract_method_results,
+                0.0,
+                f"not_needed(score={base_score},strict={base_strict})",
+            )
 
         # Calculate Tesseract confidence
         tesseract_confidence = self._calculate_tesseract_confidence(tesseract_method_results)
@@ -673,9 +804,17 @@ class OCRPipeline:
             paddle_text, paddle_conf = paddle_engine.extract_text(img_cv)
 
             if not paddle_text:
+                self._paddle_empty_streak += 1
+                if self._paddle_empty_streak >= self._paddle_empty_limit:
+                    self._paddle_disabled_until = time.time() + self._paddle_cooldown_seconds
+                    logger.warning(
+                        f"[OCR] PaddleOCR returned empty {self._paddle_empty_streak} times; "
+                        f"disabling fallback for {self._paddle_cooldown_seconds}s"
+                    )
                 logger.warning("[OCR] PaddleOCR returned empty result")
                 return tesseract_text, tesseract_method_results, 0.0, "paddleocr_empty"
 
+            self._paddle_empty_streak = 0
             logger.info(f"[OCR] PaddleOCR result: '{paddle_text}' (confidence: {paddle_conf:.1f}%)")
 
             # Add to method results

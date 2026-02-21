@@ -48,16 +48,32 @@ class HeaderValidator:
         if len(parts) >= self.config.min_expected_parts:
             score += 20
 
-        # Strong score path using configured regex
+        serial = parts[-1] if parts else ""
+        serial_valid = self._valid_serial(serial)
+
+        # Regex bonus, but do not early-return. We still gate final score by serial validity.
         if self.config.enable_pattern_check and self._header_pattern and self._header_pattern.match(corrected):
-            score += 120
-            return score, corrected
+            score += 60
 
         # Structured fallback validation
         structure_score = self._score_structure(parts)
         score += structure_score
 
+        # Hard gate: invalid serial cannot be high-confidence.
+        if not serial_valid:
+            score = min(score, self.config.invalid_serial_score_cap)
+
         return score, corrected
+
+    def is_strict_header(self, text: str) -> bool:
+        """Check if normalized header passes strict serial validation."""
+        _, corrected = self.validate_and_score(text)
+        if not corrected:
+            return False
+        parts = corrected.split(self.config.expected_separator)
+        if len(parts) < self.config.min_expected_parts:
+            return False
+        return self._valid_serial(parts[-1])
 
     def headers_match(self, header1: str, header2: str, threshold: float = 1.0) -> bool:
         """
@@ -82,10 +98,22 @@ class HeaderValidator:
             if prefix_a == prefix_b:
                 serial_a = parts_a[-1]
                 serial_b = parts_b[-1]
-                if score_a >= 130 and score_b >= 130:
+                strict_a = self._valid_serial(serial_a)
+                strict_b = self._valid_serial(serial_b)
+
+                # Both strict: must be exact serial match.
+                if strict_a and strict_b:
                     return serial_a == serial_b
-                if self._serials_close(serial_a, serial_b):
+
+                # One strict + one weak: allow close match for OCR drift correction.
+                if strict_a != strict_b and self._serials_close(serial_a, serial_b):
                     return True
+
+                # Both weak/non-strict: be conservative and require exact equality
+                # to prevent false merges like R4092558 vs R4092528.
+                if not strict_a and not strict_b:
+                    return serial_a == serial_b
+
                 return False
 
         similarity = SequenceMatcher(None, a, b).ratio()
@@ -181,7 +209,7 @@ class HeaderValidator:
             if self._valid_serial(serial):
                 score += 35
             elif self._has_serial_like_digits(serial):
-                score += 18
+                score += 4
             return score
 
         if len(parts) == self.config.min_expected_parts:
@@ -200,7 +228,7 @@ class HeaderValidator:
             if self._valid_serial(serial):
                 score += 25
             elif self._has_serial_like_digits(serial):
-                score += 12
+                score += 4
             return score
 
         return score
@@ -211,11 +239,23 @@ class HeaderValidator:
         serial = serial.upper()
 
         starts_with_allowed = serial[0] in self.config.pattern_serial_allowed_prefixes
-        digits = "".join(ch for ch in (serial[1:] if starts_with_allowed else serial) if ch.isdigit())
+
+        if self.config.serial_prefix_required and not starts_with_allowed:
+            return False
+
+        serial_body = serial[1:] if starts_with_allowed else serial
+        if not serial_body:
+            return False
+        if not serial_body.isdigit():
+            return False
+        digits = serial_body
 
         if len(digits) < self.config.min_digit_count:
             return False
-        if len(digits) > self.config.expected_digit_count + 4:
+        if self.config.serial_digits_exact > 0:
+            if len(digits) != self.config.serial_digits_exact:
+                return False
+        elif len(digits) > self.config.expected_digit_count + 2:
             return False
 
         digit_ratio = len(digits) / max(1, len(serial))
@@ -224,7 +264,7 @@ class HeaderValidator:
 
         if starts_with_allowed:
             serial_len = len(serial)
-            return self.config.pattern_serial_min <= serial_len <= (self.config.pattern_serial_max + 3)
+            return self.config.pattern_serial_min <= serial_len <= self.config.pattern_serial_max
 
         # Allow masked/secure serial variants without strict prefix.
         return serial.isalnum() and len(serial) >= self.config.min_digit_count
@@ -243,7 +283,7 @@ class HeaderValidator:
             return False
 
         ratio = SequenceMatcher(None, digits_a, digits_b).ratio()
-        return ratio >= 0.85
+        return ratio >= self.config.serial_close_match_threshold
 
     def _parse_ambiguous_map(self, mapping: str) -> Dict[str, str]:
         """

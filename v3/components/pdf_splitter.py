@@ -10,7 +10,7 @@ import tempfile
 import time
 import logging
 from pathlib import Path
-from typing import List, Tuple, Optional
+from typing import Dict, List, Tuple, Optional
 from v3.utils.config_manager import ExtractionConfig
 from v3.components.header_validator import HeaderValidator
 from v3.components.output_organizer import OutputOrganizer
@@ -233,7 +233,15 @@ class PdfSplitter:
         page_count = page_headers[-1][0] - current_start + 1
         logger.debug(f"Group: '{best_header}' pages {current_start+1}-{page_headers[-1][0]+1} ({page_count} pages)")
         groups.append((current_start, page_headers[-1][0], best_header))
-        
+
+        # Apply conservative context correction (single-page OCR outliers).
+        initial_group_count = len(groups)
+        groups = self._apply_context_correction(groups)
+        if len(groups) != initial_group_count:
+            logger.info(
+                f"Context correction merged {initial_group_count - len(groups)} group(s)"
+            )
+
         logger.info(f"Detected {len(groups)} header groups")
         
         # Filter by min_pages_per_split (skip if min is 0)
@@ -271,37 +279,125 @@ class PdfSplitter:
         """
         if len(groups) <= 1:
             return groups
-        
+
+        # Work on a mutable copy so we can merge a single-page group into the
+        # next neighbor without index gymnastics.
+        working = list(groups)
         corrected = []
         i = 0
-        
-        while i < len(groups):
-            current_start, current_end, current_header = groups[i]
+
+        while i < len(working):
+            current_start, current_end, current_header = working[i]
             current_pages = current_end - current_start + 1
-            
-            # Check if this is a single-page group
-            if current_pages == 1 and i > 0:
-                # Compare with previous group
-                prev_start, prev_end, prev_header = corrected[-1]
-                
-                # Check if headers are similar (likely OCR error)
-                if self._is_likely_ocr_error(current_header, prev_header):
-                    # Merge with previous group
-                    logger.info(
-                        f"Context correction: Merging page {current_start+1} "
-                        f"('{current_header}') with previous group "
-                        f"(pages {prev_start+1}-{prev_end+1}, '{prev_header}') - likely OCR error"
+
+            # Check if this is a single-page outlier.
+            if current_pages == 1:
+                prev_group = corrected[-1] if corrected else None
+                next_group = working[i + 1] if i + 1 < len(working) else None
+
+                prev_match = (
+                    prev_group is not None
+                    and self._is_likely_ocr_error(current_header, prev_group[2])
+                )
+                next_match = (
+                    next_group is not None
+                    and self._is_likely_ocr_error(current_header, next_group[2])
+                )
+
+                if prev_match or next_match:
+                    merge_side = self._select_merge_side(
+                        current_header=current_header,
+                        prev_group=prev_group,
+                        next_group=next_group,
+                        prev_match=prev_match,
+                        next_match=next_match,
                     )
-                    # Update last group to extend range
-                    corrected[-1] = (prev_start, current_end, prev_header)
-                    i += 1
-                    continue
-            
-            # No correction needed, add as-is
+
+                    if merge_side == "prev" and prev_group is not None:
+                        prev_start, prev_end, prev_header = prev_group
+                        logger.info(
+                            f"Context correction: merged page {current_start + 1} "
+                            f"('{current_header}') into previous group "
+                            f"(pages {prev_start + 1}-{prev_end + 1}, '{prev_header}')"
+                        )
+                        corrected[-1] = (prev_start, current_end, prev_header)
+                        i += 1
+                        continue
+
+                    if merge_side == "next" and next_group is not None:
+                        next_start, next_end, next_header = next_group
+                        logger.info(
+                            f"Context correction: merged page {current_start + 1} "
+                            f"('{current_header}') into next group "
+                            f"(pages {next_start + 1}-{next_end + 1}, '{next_header}')"
+                        )
+                        working[i + 1] = (current_start, next_end, next_header)
+                        i += 1
+                        continue
+
             corrected.append((current_start, current_end, current_header))
             i += 1
-        
-        return corrected
+
+        return self._merge_adjacent_groups(corrected)
+
+    def _select_merge_side(
+        self,
+        current_header: str,
+        prev_group: Optional[Tuple[int, int, str]],
+        next_group: Optional[Tuple[int, int, str]],
+        prev_match: bool,
+        next_match: bool,
+    ) -> Optional[str]:
+        """
+        Choose merge side for a single-page outlier.
+
+        Preference:
+        - if only one side matches, use that side
+        - if both sides match, choose side with stronger neighbor confidence
+        """
+        if prev_match and not next_match:
+            return "prev"
+        if next_match and not prev_match:
+            return "next"
+        if not prev_match and not next_match:
+            return None
+
+        prev_rank = self._neighbor_rank(current_header, prev_group) if prev_group else -1
+        next_rank = self._neighbor_rank(current_header, next_group) if next_group else -1
+        return "next" if next_rank > prev_rank else "prev"
+
+    def _neighbor_rank(
+        self,
+        current_header: str,
+        neighbor_group: Optional[Tuple[int, int, str]],
+    ) -> int:
+        """
+        Rank neighbor trustworthiness when both sides look mergeable.
+        """
+        if neighbor_group is None:
+            return -1
+        start, end, header = neighbor_group
+        pages = end - start + 1
+        score, normalized = self.validator.validate_and_score(header)
+        strict_bonus = 20 if self.validator.is_strict_header(normalized if normalized else header) else 0
+        return score + strict_bonus + min(10, pages)
+
+    def _merge_adjacent_groups(
+        self,
+        groups: List[Tuple[int, int, str]]
+    ) -> List[Tuple[int, int, str]]:
+        """Merge adjacent groups that ended up with exactly the same header."""
+        if not groups:
+            return groups
+
+        merged = [groups[0]]
+        for start, end, header in groups[1:]:
+            last_start, last_end, last_header = merged[-1]
+            if start == last_end + 1 and header == last_header:
+                merged[-1] = (last_start, end, last_header)
+            else:
+                merged.append((start, end, header))
+        return merged
     
     def _is_likely_ocr_error(self, header1: str, header2: str) -> bool:
         """
@@ -323,6 +419,19 @@ class PdfSplitter:
         Returns:
             bool: True if likely an OCR error
         """
+        # Never collapse two different strict-valid headers.
+        _, norm1 = self.validator.validate_and_score(header1)
+        _, norm2 = self.validator.validate_and_score(header2)
+        strict1 = self.validator.is_strict_header(norm1 if norm1 else header1)
+        strict2 = self.validator.is_strict_header(norm2 if norm2 else header2)
+        if strict1 and strict2 and norm1 != norm2:
+            # Allow a very specific strict-vs-strict repair:
+            # same prefix + one serial is exactly the other with one trailing digit.
+            # Example: R4092527 vs R40925274
+            if self._is_serial_tail_digit_variant(norm1, norm2):
+                return True
+            return False
+
         # Quick check: if too different in length, not OCR error (unless missing separator)
         if abs(len(header1) - len(header2)) > 5:
             return False
@@ -418,6 +527,41 @@ class PdfSplitter:
                 return True
         
         return False
+
+    def _is_serial_tail_digit_variant(self, header1: str, header2: str) -> bool:
+        """
+        Detect strict headers where one serial is the other plus one trailing digit.
+        """
+        if not header1 or not header2:
+            return False
+
+        parts1 = header1.split(self.config.expected_separator)
+        parts2 = header2.split(self.config.expected_separator)
+        if len(parts1) < 3 or len(parts2) < 3:
+            return False
+
+        prefix1 = parts1[:-1]
+        prefix2 = parts2[:-1]
+        if prefix1 != prefix2:
+            return False
+
+        serial1 = parts1[-1]
+        serial2 = parts2[-1]
+        if not serial1 or not serial2:
+            return False
+
+        if serial1[0] != serial2[0]:
+            return False
+
+        digits1 = "".join(c for c in serial1[1:] if c.isdigit())
+        digits2 = "".join(c for c in serial2[1:] if c.isdigit())
+        if not digits1 or not digits2:
+            return False
+
+        long_digits, short_digits = (digits1, digits2) if len(digits1) >= len(digits2) else (digits2, digits1)
+        if len(long_digits) - len(short_digits) != 1:
+            return False
+        return long_digits.startswith(short_digits)
     
     def _strings_similar(self, s1: str, s2: str, threshold: float = 0.7) -> bool:
         """Check if two strings are similar above threshold"""
@@ -463,18 +607,43 @@ class PdfSplitter:
         """Select the best header from a list of similar headers"""
         if not headers:
             return ""
-        
+
         if len(headers) == 1:
-            return headers[0]
-        
-        # Score each header and pick best
-        scored = []
+            score, corrected = self.validator.validate_and_score(headers[0])
+            return corrected if score > 0 and corrected else headers[0]
+
+        # Vote by normalized header first, then confidence.
+        candidates: Dict[str, Dict[str, int]] = {}
         for header in headers:
-            score, _ = self.validator.validate_and_score(header)
-            scored.append((score, header))
-        
-        scored.sort(key=lambda x: x[0], reverse=True)
-        return scored[0][1]
+            score, corrected = self.validator.validate_and_score(header)
+            normalized = corrected if corrected else header
+            strict_valid = self.validator.is_strict_header(normalized)
+
+            if normalized not in candidates:
+                candidates[normalized] = {
+                    "count": 0,
+                    "best_score": score,
+                    "strict_valid": 1 if strict_valid else 0,
+                }
+            candidates[normalized]["count"] += 1
+            candidates[normalized]["best_score"] = max(
+                candidates[normalized]["best_score"], score
+            )
+            if strict_valid:
+                candidates[normalized]["strict_valid"] = 1
+
+        ranked = sorted(
+            candidates.items(),
+            key=lambda item: (
+                item[1]["count"],
+                item[1]["strict_valid"],
+                item[1]["best_score"],
+                len(item[0]),
+                item[0],
+            ),
+            reverse=True,
+        )
+        return ranked[0][0]
     
     def _create_pdf_subset(
         self,
@@ -536,8 +705,30 @@ class PdfSplitter:
                     continue
                 except FileNotFoundError:
                     # Temp file disappeared unexpectedly (e.g. external lock/cleanup).
-                    # Break to fallback path regeneration.
+                    # Break to regeneration flow.
                     break
+
+            # Temp file disappeared before replace; regenerate subset.
+            if not temp_path.exists():
+                regen_target = target
+                if regen_target.exists():
+                    regen_target = self.output_organizer.get_unique_output_path(
+                        f"{output_path.stem}_regen{output_path.suffix}"
+                    )
+                regen_doc = fitz.open()
+                try:
+                    regen_doc.insert_pdf(
+                        source_doc,
+                        from_page=start_page,
+                        to_page=end_page
+                    )
+                    regen_doc.save(str(regen_target))
+                    logger.warning(
+                        f"Temp file missing during replace, regenerated subset: {regen_target.name}"
+                    )
+                    return regen_target
+                finally:
+                    regen_doc.close()
 
             # Final fallback: write to alternate filename if target is locked
             fallback_target = self.output_organizer.get_unique_output_path(
