@@ -187,7 +187,7 @@ class PDFTextExtractorV3:
                         ocr_method=ocr_info.get('method', 'unknown'),
                         processing_time_ms=processing_time_ms,
                         render_scale=ocr_info.get('render_scale', 2.0),
-                        status='success' if ocr_info.get('confidence_score', 0) >= 150 else 'low_confidence'
+                        status='success' if ocr_info.get('confidence_score', 0) >= 130 else 'low_confidence'
                     )
                 else:
                     # Record failed extraction

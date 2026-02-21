@@ -280,8 +280,8 @@ Old files cleaned automatically after 90 days
 ### Issue: "Module v3 not found"
 **Solution:** Make sure you're in the project root directory
 
-### Issue: "Can't import pdf_extractorV2"
-**Solution:** OCRPipeline needs V2 file. Make sure `pdf_extractorV2.py` exists in project root
+### Issue: "Import error in OCR pipeline"
+**Solution:** Ensure dependencies are installed from `requirements.txt` and run from project root
 
 ### Issue: "Output folder not created"
 **Solution:** Check permissions and path in config.ini:

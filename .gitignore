@@ -59,3 +59,14 @@ desktop.ini
 # Project specific
 unnamed.pdf
 unnamed_*.pdf
+
+# Runtime artifacts
+input/
+output/
+reports/
+logs/
+debug_images/
+metrics.json
+v3/metrics.json
+pdf_watcher.log
+test_output.log

@@ -4,7 +4,9 @@ Extracted from V2 with improvements
 """
 
 import fitz  # PyMuPDF
+import os
 import re
+import time
 import logging
 from pathlib import Path
 from typing import List, Tuple, Optional
@@ -101,25 +103,24 @@ class PdfSplitter:
                 if not filename.endswith('.pdf'):
                     filename += '.pdf'
                 
-                # Get organized output path (overwrite if exists)
+                # Use deterministic target path; _create_pdf_subset handles
+                # overwrite/lock fallback safely.
                 output_path = self.output_organizer.get_output_path(filename)
                 
                 # Copy entire PDF
-                success = self._create_pdf_subset(doc, 0, total_pages - 1, output_path)
+                saved_path = self._create_pdf_subset(doc, 0, total_pages - 1, output_path)
                 
                 doc.close()
                 
-                if success:
-                    logger.info(f"Copied PDF to: {output_path} (header: {header_text})")
-                    return [(output_path, header_text, (0, total_pages - 1))]
+                if saved_path:
+                    logger.info(f"Copied PDF to: {saved_path} (header: {header_text})")
+                    return [(saved_path, header_text, (0, total_pages - 1))]
                 else:
                     return []
             except Exception as e:
                 logger.error(f"Failed to copy PDF: {e}")
                 doc.close()
                 return []
-        
-        logger.info(f"Detected {len(groups)} header groups")
         
         results = []
         original_name = Path(pdf_path).stem
@@ -158,16 +159,17 @@ class PdfSplitter:
                 else:
                     filename_counter[safe_header] = 1
                 
-                # Get organized output path
+                # Use deterministic target path; _create_pdf_subset handles
+                # overwrite/lock fallback safely.
                 output_path = self.output_organizer.get_output_path(filename)
                 
                 # Create new PDF with pages
-                success = self._create_pdf_subset(doc, start_page, end_page, output_path)
+                saved_path = self._create_pdf_subset(doc, start_page, end_page, output_path)
                 
-                if success:
-                    results.append((output_path, header_text, (start_page, end_page)))
+                if saved_path:
+                    results.append((saved_path, header_text, (start_page, end_page)))
                     logger.info(
-                        f"Created split PDF: {output_path.name} "
+                        f"Created split PDF: {saved_path.name} "
                         f"(pages {start_page + 1}-{end_page + 1}, header: {header_text})"
                     )
             
@@ -231,11 +233,7 @@ class PdfSplitter:
         logger.debug(f"Group: '{best_header}' pages {current_start+1}-{page_headers[-1][0]+1} ({page_count} pages)")
         groups.append((current_start, page_headers[-1][0], best_header))
         
-        logger.info(f"Detected {len(groups)} header groups (before context correction)")
-        
-        # Apply context-based correction for likely OCR errors
-        groups = self._apply_context_correction(groups)
-        logger.info(f"After context correction: {len(groups)} header groups")
+        logger.info(f"Detected {len(groups)} header groups")
         
         # Filter by min_pages_per_split (skip if min is 0)
         if self.config.min_pages_per_split > 0:
@@ -483,7 +481,7 @@ class PdfSplitter:
         start_page: int,
         end_page: int,
         output_path: Path
-    ) -> bool:
+    ) -> Optional[Path]:
         """
         Create new PDF from page range
         
@@ -494,8 +492,10 @@ class PdfSplitter:
             output_path: Output file path
         
         Returns:
-            bool: True if successful
+            Optional[Path]: Saved path if successful, None if failed
         """
+        temp_path: Optional[Path] = None
+        new_doc: Optional[fitz.Document] = None
         try:
             # Create new document
             new_doc = fitz.open()
@@ -507,16 +507,49 @@ class PdfSplitter:
                 to_page=end_page
             )
             
-            # Save
+            # Save to temp file first, then atomically replace target to avoid
+            # permission issues when destination file already exists/locked.
             output_path.parent.mkdir(parents=True, exist_ok=True)
-            new_doc.save(str(output_path))
+            temp_path = output_path.parent / f".{output_path.stem}_{int(time.time() * 1000)}.tmp.pdf"
+            new_doc.save(str(temp_path))
             new_doc.close()
-            
-            return True
-        
+            new_doc = None
+
+            target = output_path
+            retry_delays = [0.0, 0.2, 0.6]
+            for delay in retry_delays:
+                try:
+                    if delay > 0:
+                        time.sleep(delay)
+                    os.replace(str(temp_path), str(target))
+                    return target
+                except PermissionError:
+                    continue
+
+            # Final fallback: write to alternate filename if target is locked
+            fallback_target = self.output_organizer.get_unique_output_path(
+                f"{output_path.stem}_locked{output_path.suffix}"
+            )
+            os.replace(str(temp_path), str(fallback_target))
+            logger.warning(
+                f"Target file was locked, saved to fallback path: {fallback_target.name}"
+            )
+            return fallback_target
+
         except Exception as e:
             logger.error(f"Failed to create PDF subset: {e}")
-            return False
+            return None
+        finally:
+            if new_doc is not None:
+                try:
+                    new_doc.close()
+                except Exception:
+                    pass
+            if temp_path and temp_path.exists():
+                try:
+                    temp_path.unlink()
+                except Exception:
+                    pass
     
     def _sanitize_filename(self, text: str) -> str:
         """Convert text to safe filename"""

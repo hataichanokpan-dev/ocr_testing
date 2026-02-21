@@ -66,6 +66,7 @@ class ExtractionConfig:
     ocr_black_threshold: int = 100
     
     # OCR Enhancement (V3.1 - Full Upgrade)
+    tesseract_cmd: str = ''
     tesseract_psm_mode: int = 7
     tesseract_char_whitelist: str = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-'
     enable_deskewing: bool = True
@@ -125,7 +126,7 @@ class ExtractionConfig:
     enable_paddleocr_fallback: bool = True
     tesseract_confidence_threshold: float = 85.0
     enable_pattern_check: bool = True
-    header_pattern: str = r'^[A-Z]-[A-Z]{1,2}-[A-Z0-9]{2,4}-[SR][0-9]{6,8}$'
+    header_pattern: str = r'^[A-Z](?:-[A-Z0-9]{1,8}){2,3}$'
     ambiguous_characters: str = 'S:5,B:8,P:F,O:0,I:1,Z:2'
     character_whitelist: str = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-'
     enable_ensemble_voting: bool = True
@@ -235,6 +236,7 @@ class ConfigManager:
             ocr_black_threshold=settings.getint('ocr_black_threshold', 100),
             
             # OCR Enhancement (V3.1)
+            tesseract_cmd=settings.get('tesseract_cmd', ''),
             tesseract_psm_mode=settings.getint('tesseract_psm_mode', 7),
             tesseract_char_whitelist=settings.get('tesseract_char_whitelist', 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-'),
             enable_deskewing=settings.getboolean('enable_deskewing', True),
@@ -294,7 +296,7 @@ class ConfigManager:
             enable_paddleocr_fallback=settings.getboolean('enable_paddleocr_fallback', True),
             tesseract_confidence_threshold=settings.getfloat('tesseract_confidence_threshold', 85.0),
             enable_pattern_check=settings.getboolean('enable_pattern_check', True),
-            header_pattern=settings.get('header_pattern', r'^[A-Z]-[A-Z]{1,2}-[A-Z0-9]{2,4}-[SR][0-9]{6,8}$'),
+            header_pattern=settings.get('header_pattern', r'^[A-Z](?:-[A-Z0-9]{1,8}){2,3}$'),
             ambiguous_characters=settings.get('ambiguous_characters', 'S:5,B:8,P:F,O:0,I:1,Z:2'),
             character_whitelist=settings.get('character_whitelist', 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-'),
             enable_ensemble_voting=settings.getboolean('enable_ensemble_voting', True),

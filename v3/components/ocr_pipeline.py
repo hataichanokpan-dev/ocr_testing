@@ -1,27 +1,20 @@
 """
-OCR Pipeline - Simplified V3 that reuses V2 OCR methods
+OCR Pipeline - V3 OCR orchestration
 Adds V3 improvements: adaptive rendering, early exit, metrics integration
 Adds PaddleOCR fallback when Tesseract conditions are not met
 """
 
-import sys
-import os
 import logging
+import os
+import shutil
 from pathlib import Path
 from typing import Dict, Tuple, List, Optional
-from collections import Counter
+from collections import Counter, defaultdict
 from PIL import Image
-
-# Add parent directory to path to import V2
-parent_dir = str(Path(__file__).parent.parent.parent)
-if parent_dir not in sys.path:
-    sys.path.insert(0, parent_dir)
-
-# Import V2 OCR extractor to reuse methods
-from pdf_extractorV2 import PDFTextExtractor as V2Extractor
 
 from v3.utils.config_manager import ExtractionConfig
 from v3.utils.ocr_context import OCRContext
+from v3.utils.ocr_enhancer import OCREnhancer
 from v3.components.header_validator import HeaderValidator
 from v3.utils.debug_manager import DebugImageManager
 from v3.utils.metrics_tracker import MetricsTracker
@@ -33,14 +26,12 @@ logger = logging.getLogger(__name__)
 
 class OCRPipeline:
     """
-    V3 OCR Pipeline - Improved version of V2 with:
+    V3 OCR Pipeline with:
     - Adaptive rendering (2x -> 3x -> 6x)
     - Early exit when score is good enough
     - Better metrics integration
     - Thread-safe (no shared state)
     - PaddleOCR fallback when Tesseract conditions are not met
-
-    Reuses V2's proven OCR methods while adding V3 optimizations
     """
 
     def __init__(
@@ -63,30 +54,16 @@ class OCRPipeline:
         self.validator = validator
         self.debug_manager = debug_manager
         self.metrics_tracker = metrics_tracker
-
-        # Create V2 extractor instance (for reusing methods)
-        # We'll use a dummy config just to initialize it
-        import configparser
-        dummy_config = configparser.ConfigParser()
-        dummy_config['Settings'] = {}
-        self.v2_extractor = V2Extractor(dummy_config)
-
-        # Copy config values we need
-        self.v2_extractor.expected_separator = config.expected_separator
-        self.v2_extractor.enable_pattern_validation = config.enable_pattern_validation
-
-        # Initialize V2 debug attributes (required by V2 methods)
-        self.v2_extractor._current_debug_filename = ""
-        self.v2_extractor._current_debug_page = 0
-        self.v2_extractor.save_method_images = config.save_debug_images
+        self.ocr_enhancer = OCREnhancer(config)
 
         # Initialize PaddleOCR fallback (lazy loading)
         self._paddleocr_engine: Optional[PaddleOCREngine] = None
         self._fallback_checker: Optional[FallbackChecker] = None
         self._enable_paddleocr_fallback = config.enable_paddleocr_fallback
         self._enable_ensemble_voting = config.enable_ensemble_voting
+        self._tesseract_available = self._configure_tesseract()
 
-        logger.info("OCR Pipeline V3.2 initialized (using V2 methods + PaddleOCR fallback)")
+        logger.info("OCR Pipeline V3.2 initialized (native V3 methods + PaddleOCR fallback)")
 
     def _get_fallback_checker(self) -> FallbackChecker:
         """Get or create FallbackChecker instance (lazy loading)"""
@@ -105,6 +82,64 @@ class OCRPipeline:
                 logger.warning(f"Failed to initialize PaddleOCR: {e}")
                 self._paddleocr_engine = None
         return self._paddleocr_engine
+
+    def _configure_tesseract(self) -> bool:
+        """
+        Configure and verify Tesseract executable path.
+
+        Resolution order:
+        1) `tesseract_cmd` in config.ini
+        2) `TESSERACT_CMD` environment variable
+        3) `tesseract` from PATH
+        4) Common Windows install paths
+        """
+        import pytesseract
+
+        candidate_paths: List[str] = []
+
+        config_cmd = (getattr(self.config, "tesseract_cmd", "") or "").strip()
+        if config_cmd:
+            candidate_paths.append(config_cmd)
+
+        env_cmd = os.environ.get("TESSERACT_CMD", "").strip()
+        if env_cmd:
+            candidate_paths.append(env_cmd)
+
+        path_cmd = shutil.which("tesseract")
+        if path_cmd:
+            candidate_paths.append(path_cmd)
+
+        if os.name == "nt":
+            candidate_paths.extend([
+                r"C:\Program Files\Tesseract-OCR\tesseract.exe",
+                r"C:\Program Files (x86)\Tesseract-OCR\tesseract.exe",
+            ])
+
+        seen = set()
+        resolved_candidates = []
+        for cmd in candidate_paths:
+            if not cmd:
+                continue
+            if cmd.lower() in seen:
+                continue
+            seen.add(cmd.lower())
+            resolved_candidates.append(cmd)
+
+        for cmd in resolved_candidates:
+            if Path(cmd).exists() or cmd.lower() == "tesseract":
+                try:
+                    pytesseract.pytesseract.tesseract_cmd = cmd
+                    _ = pytesseract.get_tesseract_version()
+                    logger.info(f"Tesseract configured: {cmd}")
+                    return True
+                except Exception:
+                    continue
+
+        logger.error(
+            "Tesseract is not available. Set `tesseract_cmd` in v3/config.ini "
+            "or install Tesseract and add it to PATH."
+        )
+        return False
 
     def _is_code_suspiciously_short(self, text: str) -> bool:
         """
@@ -268,11 +303,13 @@ class OCRPipeline:
         """
         Run multiple OCR methods and vote for best result
         
-        Reuses V2's proven methods with V3's OCR budget control
+        Runs native V3 OCR methods with budget control
         """
         import cv2
         import numpy as np
-        import pytesseract
+
+        if not self._tesseract_available:
+            return "", {'tesseract': {'text': '', 'score': -1, 'error': 'tesseract_not_available'}}, 0.0
         
         # Convert to OpenCV format
         img_cv = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
@@ -287,70 +324,231 @@ class OCRPipeline:
                 cv2.THRESH_TOZERO
             )
         
-        results = []
-        method_results = {}
-        custom_config = '--psm 7 --oem 3 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-'
-        
-        # Set V2 extractor context (required by V2 methods for debug saving)
-        self.v2_extractor._current_debug_filename = context.filename
-        self.v2_extractor._current_debug_page = context.page_num
-        
-        # Method priority (voting methods first for best accuracy)
+        results: List[str] = []
+        method_results: Dict[str, Dict] = {}
+        text_confidences: Dict[str, List[float]] = defaultdict(list)
+
+        tesseract_configs = self._get_tesseract_configs()
         methods = [
-            ('method2', lambda: self.v2_extractor._method2_threshold(gray, custom_config)),
-            ('method3', lambda: self.v2_extractor._method3_adaptive(gray, custom_config)),
-            ('method4', lambda: self.v2_extractor._method4_otsu(gray, custom_config)),
-            ('method5', lambda: self.v2_extractor._method5_bilateral(gray, custom_config)),
+            ("method2", self._method2_threshold),
+            ("method3", self._method3_adaptive),
+            ("method4", self._method4_otsu),
+            ("method5", self._method5_bilateral),
         ]
-        
+
         attempts = 0
-        for method_name, method_func in methods:
-            if attempts >= self.config.max_ocr_attempts:
-                logger.debug(f"Reached max OCR attempts: {self.config.max_ocr_attempts}")
-                break
-            
-            try:
-                text, score = method_func()
-                if text:
-                    results.append(text)
-                    method_results[method_name] = {'text': text, 'score': score}
+        early_exit = False
+        for psm_mode, custom_config in tesseract_configs:
+            for method_name, method_func in methods:
+                if attempts >= self.config.max_ocr_attempts:
+                    logger.debug(f"Reached max OCR attempts: {self.config.max_ocr_attempts}")
+                    break
+
+                method_key = f"{method_name}_psm{psm_mode}"
+                try:
+                    text, score, confidence = method_func(gray, custom_config, context)
                     attempts += 1
-                    
-                    # Early exit if excellent score
-                    if score >= self.config.early_exit_score:
-                        logger.debug(f"{method_name} got excellent score: {score}")
-                        break
-            
-            except Exception as e:
-                logger.error(f"{method_name} failed: {e}")
-        
-        # Vote for best result using Validator Score + Frequency
+
+                    if text:
+                        results.append(text)
+                        text_confidences[text].append(confidence)
+                        method_results[method_key] = {
+                            "text": text,
+                            "score": score,
+                            "confidence": confidence,
+                            "psm_mode": psm_mode,
+                        }
+
+                        # Early exit only when structure score + OCR confidence are both strong.
+                        if (
+                            score >= self.config.early_exit_score
+                            and confidence >= self.config.tesseract_confidence_threshold
+                        ):
+                            logger.debug(
+                                f"{method_key} got excellent result (score={score}, conf={confidence:.1f}%)"
+                            )
+                            early_exit = True
+                            break
+                    else:
+                        method_results[method_key] = {
+                            "text": "",
+                            "score": -1,
+                            "confidence": confidence,
+                            "psm_mode": psm_mode,
+                        }
+
+                except Exception as e:
+                    logger.error(f"{method_key} failed: {e}")
+
+            if early_exit or attempts >= self.config.max_ocr_attempts:
+                break
+
+        # Vote for best result using validator score + confidence + frequency
         if results:
             frequency = Counter(results)
-
-            # Score each unique result
             scored_results = []
             for text in set(results):
                 score, corrected = self.validator.validate_and_score(text)
                 freq = frequency[text]
+                conf_values = text_confidences.get(text, [])
+                avg_conf = sum(conf_values) / len(conf_values) if conf_values else 0.0
+                weighted = (score * 0.7) + (avg_conf * 0.3)
                 scored_results.append({
-                    'text': text,
-                    'corrected': corrected,
-                    'score': score,
-                    'frequency': freq
+                    "text": text,
+                    "corrected": corrected,
+                    "score": score,
+                    "frequency": freq,
+                    "avg_confidence": avg_conf,
+                    "weighted": weighted,
                 })
 
-            # Sort by: score first (higher is better), then by frequency (higher is better)
-            scored_results.sort(key=lambda x: (x['score'], x['frequency']), reverse=True)
+            scored_results.sort(
+                key=lambda x: (x["weighted"], x["score"], x["frequency"], x["avg_confidence"]),
+                reverse=True,
+            )
 
             best = scored_results[0]
-            most_common_text = best['corrected'] if best['score'] > 0 else best['text']
-            freq_ratio = best['frequency'] / len(results)
+            most_common_text = best["corrected"] if best["score"] > 0 else best["text"]
+            freq_ratio = best["frequency"] / len(results)
 
-            logger.debug(f"OCR voting: best='{most_common_text}' (score={best['score']}, freq={best['frequency']})")
+            logger.debug(
+                f"OCR voting: best='{most_common_text}' "
+                f"(score={best['score']}, conf={best['avg_confidence']:.1f}%, freq={best['frequency']})"
+            )
             return most_common_text, method_results, freq_ratio
 
         return "", method_results, 0.0
+
+    def _get_tesseract_configs(self) -> List[Tuple[int, str]]:
+        """Build Tesseract config variants (multi-PSM) for better per-page reading."""
+        whitelist = self.config.tesseract_char_whitelist or "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-"
+        psm_modes = [self.config.tesseract_psm_mode, 6, 7, 13]
+        seen = set()
+        variants: List[Tuple[int, str]] = []
+        for psm in psm_modes:
+            if psm in seen:
+                continue
+            seen.add(psm)
+            config = f"--psm {psm} --oem 3 -c tessedit_char_whitelist={whitelist}"
+            variants.append((psm, config))
+        return variants
+
+    def _ocr_text_and_confidence(self, image, custom_config: str) -> Tuple[str, float]:
+        """Run OCR and estimate confidence from Tesseract per-token data."""
+        import pytesseract
+
+        text = pytesseract.image_to_string(image, lang="eng", config=custom_config).strip()
+        if not text:
+            return "", 0.0
+
+        confidence_values: List[float] = []
+        try:
+            data = pytesseract.image_to_data(
+                image,
+                lang="eng",
+                config=custom_config,
+                output_type=pytesseract.Output.DICT,
+            )
+            for raw_conf in data.get("conf", []):
+                try:
+                    conf = float(raw_conf)
+                except Exception:
+                    continue
+                if conf >= 0:
+                    confidence_values.append(conf)
+        except Exception:
+            pass
+
+        avg_conf = sum(confidence_values) / len(confidence_values) if confidence_values else 0.0
+        return text, avg_conf
+
+    def _save_method_debug_image(
+        self,
+        image,
+        context: OCRContext,
+        method_name: str
+    ) -> None:
+        """Save OCR method output image if method-image debug is enabled."""
+        if self.config.save_method_images and self.debug_manager.enabled:
+            self.debug_manager.save_image(image, context.filename, context.page_num, method_name)
+
+    def _method2_threshold(
+        self,
+        gray,
+        custom_config: str,
+        context: OCRContext
+    ) -> Tuple[str, int, float]:
+        """Method 2: Enhanced thresholding with V3 pre-processing."""
+        import cv2
+
+        processed = self.ocr_enhancer.enhance_image(gray)
+        _, thresh = cv2.threshold(processed, 200, 255, cv2.THRESH_BINARY)
+        self._save_method_debug_image(thresh, context, "method2_threshold")
+
+        text, confidence = self._ocr_text_and_confidence(thresh, custom_config)
+        text = self.ocr_enhancer.apply_pattern_correction(text)
+        score, corrected = self.validator.validate_and_score(text) if text else (-1, "")
+        return corrected if corrected else text, score, confidence
+
+    def _method3_adaptive(
+        self,
+        gray,
+        custom_config: str,
+        context: OCRContext
+    ) -> Tuple[str, int, float]:
+        """Method 3: Adaptive thresholding."""
+        import cv2
+
+        adaptive = cv2.adaptiveThreshold(
+            gray,
+            255,
+            cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+            cv2.THRESH_BINARY,
+            11,
+            2
+        )
+        self._save_method_debug_image(adaptive, context, "method3_adaptive")
+
+        text, confidence = self._ocr_text_and_confidence(adaptive, custom_config)
+        text = self.ocr_enhancer.apply_pattern_correction(text)
+        score, corrected = self.validator.validate_and_score(text) if text else (-1, "")
+        return corrected if corrected else text, score, confidence
+
+    def _method4_otsu(
+        self,
+        gray,
+        custom_config: str,
+        context: OCRContext
+    ) -> Tuple[str, int, float]:
+        """Method 4: OTSU thresholding after denoise."""
+        import cv2
+
+        denoised = cv2.fastNlMeansDenoising(gray, None, 10, 7, 21)
+        _, thresh = cv2.threshold(denoised, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        self._save_method_debug_image(thresh, context, "method4_otsu")
+
+        text, confidence = self._ocr_text_and_confidence(thresh, custom_config)
+        text = self.ocr_enhancer.apply_pattern_correction(text)
+        score, corrected = self.validator.validate_and_score(text) if text else (-1, "")
+        return corrected if corrected else text, score, confidence
+
+    def _method5_bilateral(
+        self,
+        gray,
+        custom_config: str,
+        context: OCRContext
+    ) -> Tuple[str, int, float]:
+        """Method 5: Bilateral filter + OTSU threshold."""
+        import cv2
+
+        filtered = cv2.bilateralFilter(gray, 9, 75, 75)
+        _, thresh = cv2.threshold(filtered, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        self._save_method_debug_image(thresh, context, "method5_bilateral")
+
+        text, confidence = self._ocr_text_and_confidence(thresh, custom_config)
+        text = self.ocr_enhancer.apply_pattern_correction(text)
+        score, corrected = self.validator.validate_and_score(text) if text else (-1, "")
+        return corrected if corrected else text, score, confidence
 
     def _get_low_confidence_chars(
         self,
@@ -376,6 +574,9 @@ class OCRPipeline:
         import pytesseract
         import cv2
         from PIL import Image as PILImage
+
+        if not self._tesseract_available:
+            return []
 
         try:
             # Convert to PIL
@@ -510,12 +711,19 @@ class OCRPipeline:
         if not method_results:
             return 0.0
 
-        scores = [r.get('score', 0) for r in method_results.values() if isinstance(r, dict)]
+        confidences = [
+            float(r.get("confidence", 0.0))
+            for r in method_results.values()
+            if isinstance(r, dict) and "confidence" in r
+        ]
+        confidences = [c for c in confidences if c >= 0]
+        if confidences:
+            return sum(confidences) / len(confidences)
+
+        # Backward-compatible fallback for old method results without confidence.
+        scores = [r.get("score", 0) for r in method_results.values() if isinstance(r, dict)]
         if not scores:
             return 0.0
-
-        # Convert scores to approximate confidence (score is 0-150+)
-        # Normalize to 0-100 range
         avg_score = sum(scores) / len(scores)
         confidence = min(100, max(0, avg_score / 1.5))
 
