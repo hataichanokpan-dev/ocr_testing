@@ -22,6 +22,7 @@ from v3.utils.debug_manager import DebugImageManager
 from v3.utils.metrics_tracker import MetricsTracker
 from v3.components.fallback_checker import FallbackChecker, create_fallback_checker_from_config
 from v3.components.paddleocr_engine import PaddleOCREngine, get_paddleocr_engine
+from v3.components.char_classifier import ZeroOCharClassifier
 
 logger = logging.getLogger(__name__)
 
@@ -68,6 +69,14 @@ class OCRPipeline:
         self._paddle_empty_limit = 3
         self._paddle_cooldown_seconds = 600
         self._paddle_disabled_until = 0.0
+        self._zero_o_classifier = ZeroOCharClassifier(
+            enabled=bool(getattr(config, "enable_code_char_classifier", True)),
+            min_confidence=float(getattr(config, "code_char_classifier_min_confidence", 0.72)),
+            min_margin=float(getattr(config, "code_char_classifier_min_margin", 0.12)),
+        )
+        self._box_alignment_map = self._build_box_alignment_map(
+            str(getattr(config, "code_box_alignment_ambiguity_pairs", "O:0,S:5,F:E"))
+        )
 
         logger.info("OCR Pipeline V3.2 initialized (native V3 methods + PaddleOCR fallback)")
 
@@ -232,6 +241,7 @@ class OCRPipeline:
         best_score = -1
         all_method_results = {}
         best_freq_ratio = 0.0
+        selected_scale = 0.0
         scale_candidates: List[Dict] = []
         scale_evidence_headers: List[str] = []
         
@@ -262,8 +272,10 @@ class OCRPipeline:
             score, corrected_text = self.validator.validate_and_score(text)
             chosen_text = corrected_text if corrected_text else text
             strict_valid = self.validator.is_strict_header(chosen_text)
+            shape_fitness = self.validator.header_shape_fitness(chosen_text)
             ambiguity_info = self.validator.inspect_code_ambiguity(chosen_text)
             code_ambiguous = bool(ambiguity_info.get("is_ambiguous"))
+            suspicious_for_exit, suspicious_reason = self._is_suspicious_for_early_exit(chosen_text)
             
             logger.info(
                 f"[OCR] Scale {scale}x result: '{corrected_text}' "
@@ -278,6 +290,7 @@ class OCRPipeline:
                 "method_results": method_results,
                 "scale": scale,
                 "code_ambiguous": code_ambiguous,
+                "shape_fitness": shape_fitness,
             })
             scale_evidence_headers.extend(
                 self._collect_scale_evidence_headers(chosen_text, method_results)
@@ -289,6 +302,7 @@ class OCRPipeline:
                 best_text = corrected_text
                 all_method_results = method_results
                 best_freq_ratio = freq_ratio
+                selected_scale = float(scale)
             
             # Record OCR attempt in metrics
             if self.metrics_tracker and context.job_id:
@@ -305,13 +319,25 @@ class OCRPipeline:
 
             # Early exit if score is excellent
             if strict_valid and score >= self.config.early_exit_score and not force_multi_scale_for_ambiguity:
-                logger.info(f"[OCR] Early exit: excellent score {score}")
-                break
+                if suspicious_for_exit:
+                    logger.info(
+                        f"[OCR] Early-exit guard: keep scanning scales due to suspicious header "
+                        f"({suspicious_reason})"
+                    )
+                else:
+                    logger.info(f"[OCR] Early exit: excellent score {score}")
+                    break
 
             # Don't try higher scales if score is already good
             if strict_valid and score >= self.config.score_threshold_for_escalation and not force_multi_scale_for_ambiguity:
-                logger.info(f"[OCR] Good score {score}, no need for higher scale")
-                break
+                if suspicious_for_exit:
+                    logger.info(
+                        f"[OCR] Escalation guard: continue due to suspicious header "
+                        f"({suspicious_reason})"
+                    )
+                else:
+                    logger.info(f"[OCR] Good score {score}, no need for higher scale")
+                    break
 
         # Cross-scale voting: when several scales produce close/tied candidates,
         # prefer the one most consistently repeated/similar across scales.
@@ -321,6 +347,7 @@ class OCRPipeline:
             best_score = voted["score"]
             all_method_results = voted["method_results"]
             best_freq_ratio = voted["freq_ratio"]
+            selected_scale = float(voted.get("scale", selected_scale))
             logger.info(
                 f"[OCR] Cross-scale vote selected: '{best_text}' "
                 f"(score: {best_score}, strict_valid: {voted['strict_valid']}, scale: {voted['scale']}x)"
@@ -365,14 +392,41 @@ class OCRPipeline:
             if "not_needed" not in fallback_info and "disabled" not in fallback_info:
                 best_score, best_text = self.validator.validate_and_score(best_text)
 
+        disambiguation_img = img
+        if bool(getattr(self.config, "enable_code_ambiguity_confirm_high_scale", True)) and best_text:
+            ambiguity = self.validator.inspect_code_ambiguity(best_text)
+            if ambiguity.get("is_ambiguous"):
+                confirm_scale = float(getattr(self.config, "code_ambiguity_confirm_scale", self.config.max_render_scale))
+                if confirm_scale > 0 and selected_scale + 1e-6 < confirm_scale:
+                    try:
+                        logger.info(
+                            f"[OCR] Ambiguity confirm: render {confirm_scale}x for page {context.page_num}"
+                        )
+                        mat = fitz.Matrix(confirm_scale, confirm_scale)
+                        pix = page.get_pixmap(matrix=mat, clip=rect)
+                        disambiguation_img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+                    except Exception as e:
+                        logger.warning(f"[OCR] Ambiguity confirm render failed at {confirm_scale}x: {e}")
+
         if bool(getattr(self.config, "enable_code_glyph_disambiguation", True)) and best_text:
-            refined_text, reason = self._refine_code_zero_o_with_glyph_width(best_text, img)
+            refined_text, reason = self._refine_code_zero_o_with_char_classifier(
+                best_text,
+                disambiguation_img,
+                evidence_headers=scale_evidence_headers,
+            )
+            all_method_results.setdefault("__meta__", {})
             if refined_text != best_text:
                 logger.warning(
                     f"[OCR] Code glyph disambiguation: '{best_text}' -> '{refined_text}' ({reason})"
                 )
                 best_text = refined_text
                 best_score, _ = self.validator.validate_and_score(best_text)
+                all_method_results["__meta__"]["glyph_disambiguated"] = True
+                all_method_results["__meta__"]["glyph_disambiguation_reason"] = reason
+            else:
+                all_method_results["__meta__"]["glyph_disambiguated"] = False
+                all_method_results["__meta__"]["glyph_disambiguation_reason"] = reason
+                logger.info(f"[OCR] Code glyph disambiguation skipped: {reason}")
 
         logger.info(f"[OCR] Final result: '{best_text}' (score: {best_score})")
         return best_text, all_method_results, best_freq_ratio
@@ -397,6 +451,268 @@ class OCRPipeline:
             _, normalized = self.validator.validate_and_score(text)
             evidence.append(normalized if normalized else text)
         return evidence
+
+    def rescue_ambiguous_header(
+        self,
+        page,
+        rect,
+        context: OCRContext,
+        base_header: str,
+    ) -> Tuple[str, str]:
+        """
+        One-shot rescue pass for unresolved ambiguous headers.
+        Uses a higher render scale and the same character-level disambiguation logic.
+        """
+        if not base_header:
+            return base_header, "empty_header"
+
+        try:
+            import fitz
+            from PIL import Image
+        except Exception:
+            return base_header, "rescue_import_failed"
+
+        rescue_scale = float(getattr(self.config, "code_anchor_rescue_scale", 7.5))
+        try:
+            logger.info(
+                f"[OCR] Rescue pass: render {rescue_scale}x for page {context.page_num}"
+            )
+            mat = fitz.Matrix(rescue_scale, rescue_scale)
+            pix = page.get_pixmap(matrix=mat, clip=rect)
+            rescue_img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+        except Exception as e:
+            return base_header, f"rescue_render_failed:{e}"
+
+        refined, reason = self._refine_code_zero_o_with_char_classifier(
+            base_header,
+            rescue_img,
+            evidence_headers=[base_header],
+        )
+        if refined != base_header:
+            return refined, f"rescue:{reason}"
+        return base_header, f"rescue:{reason}"
+
+    def _refine_code_zero_o_with_char_classifier(
+        self,
+        header_text: str,
+        image: Optional[Image.Image],
+        evidence_headers: Optional[List[str]] = None,
+    ) -> Tuple[str, str]:
+        """
+        Resolve O/0 ambiguity using per-character refinement.
+
+        Flow:
+        1) detect ambiguous code segment
+        2) extract per-char crop from tesseract char boxes
+        3) run lightweight 2-class classifier (0 vs O)
+        4) optional fallback to char-level tesseract on that glyph
+        5) fallback to previous width-based rule (configurable)
+        """
+        if image is None:
+            return header_text, "no_image"
+
+        ambiguity = self.validator.inspect_code_ambiguity(header_text)
+        if not ambiguity.get("is_ambiguous"):
+            return header_text, "not_ambiguous"
+
+        parts = header_text.split(self.config.expected_separator)
+        if len(parts) == self.config.expected_parts:
+            code_idx = 2
+        elif len(parts) == self.config.min_expected_parts:
+            code_idx = 1
+        else:
+            return header_text, "unsupported_format"
+
+        if code_idx >= len(parts):
+            return header_text, "offset_not_found"
+
+        code = parts[code_idx]
+        offsets = self._segment_offsets(header_text)
+        if code_idx not in offsets:
+            return header_text, "offset_not_found"
+        code_start, _code_end = offsets[code_idx]
+        char_widths = self._extract_char_widths(header_text, image)
+        zero_width_threshold = float(getattr(self.config, "code_zero_to_o_width_ratio", 1.12))
+
+        char_boxes = self._extract_char_boxes(header_text, image)
+        if not char_boxes:
+            if bool(getattr(self.config, "enable_code_glyph_width_fallback", True)):
+                return self._refine_code_zero_o_with_glyph_width(header_text, image)
+            return header_text, "no_char_boxes"
+
+        allow_leading = bool(getattr(self.config, "code_char_classifier_allow_leading_zero_to_o", False))
+        updated = list(code)
+        changed = False
+        notes: List[str] = []
+
+        for code_pos, ch in enumerate(code):
+            if ch not in {"0", "O"}:
+                continue
+
+            # Keep leading numeric code token conservative by default.
+            if code_pos == 0 and ch == "0" and not allow_leading:
+                continue
+
+            global_idx = code_start + code_pos
+            box = char_boxes.get(global_idx)
+            if not box:
+                continue
+
+            glyph = self._crop_char(image, box)
+            if glyph is None:
+                continue
+
+            votes: Dict[str, int] = {"0": 0, "O": 0}
+            vote_notes: List[str] = []
+
+            if bool(getattr(self.config, "code_char_classifier_enable_width_vote", True)):
+                zero_positions = [i for i, c in enumerate(code) if c == "0"]
+                if len(zero_positions) >= 2:
+                    width_values = []
+                    for pos in zero_positions:
+                        w = char_widths.get(code_start + pos)
+                        if w is not None:
+                            width_values.append((pos, w))
+                    if len(width_values) >= 2 and ch == "0":
+                        min_width = min(w for _, w in width_values)
+                        this_width = char_widths.get(global_idx)
+                        if min_width > 0 and this_width is not None and code_pos != 0:
+                            ratio = float(this_width) / float(min_width)
+                            if ratio >= zero_width_threshold:
+                                votes["O"] += 1
+                                vote_notes.append(f"width=O@{ratio:.2f}")
+
+            if bool(getattr(self.config, "enable_code_char_classifier", True)):
+                pred = self._zero_o_classifier.predict(glyph)
+                if pred and pred.get("accepted"):
+                    predicted = str(pred.get("predicted_char", ""))
+                    if predicted in votes:
+                        votes[predicted] += 1
+                        vote_notes.append(
+                            f"svm={predicted}@{float(pred.get('confidence', 0.0)):.2f}"
+                        )
+
+            t_char, t_conf = self._predict_zero_o_tesseract(glyph)
+            if t_char in votes:
+                votes[t_char] += 1
+                vote_notes.append(f"ocr={t_char}@{t_conf:.1f}")
+
+            predicted = ch
+            predicted_votes = votes.get(ch, 0)
+            for candidate in ("0", "O"):
+                count = votes.get(candidate, 0)
+                if count > predicted_votes:
+                    predicted = candidate
+                    predicted_votes = count
+
+            if predicted not in {"0", "O"} or predicted == ch:
+                continue
+            if code_pos == 0 and ch == "0" and predicted == "O" and not allow_leading:
+                continue
+            min_vote_support = max(
+                1,
+                int(getattr(self.config, "code_char_classifier_min_vote_support", 2)),
+            )
+            if predicted_votes < min_vote_support:
+                continue
+
+            updated[code_pos] = predicted
+            changed = True
+            notes.append(
+                f"pos{code_pos}:{ch}->{predicted}:votes={predicted_votes}({','.join(vote_notes[:2])})"
+            )
+
+        if changed:
+            parts[code_idx] = "".join(updated)
+            refined = self.config.expected_separator.join(parts)
+            if bool(getattr(self.config, "code_char_classifier_require_evidence", False)):
+                support = self._count_header_support(refined, evidence_headers or [])
+                required = max(1, int(getattr(self.config, "code_char_classifier_min_evidence_support", 1)))
+                if support < required:
+                    return header_text, f"insufficient_evidence({support}<{required})"
+            return refined, "classifier(" + ",".join(notes[:3]) + ")"
+
+        if bool(getattr(self.config, "enable_code_glyph_width_fallback", True)):
+            return self._refine_code_zero_o_with_glyph_width(header_text, image)
+        return header_text, "classifier_no_change"
+
+    def _count_header_support(self, target_header: str, evidence_headers: List[str]) -> int:
+        """
+        Count exact normalized support for a header in cross-scale/method evidence.
+        """
+        if not target_header:
+            return 0
+
+        _, target_norm = self.validator.validate_and_score(target_header)
+        target = target_norm if target_norm else target_header
+        support = 0
+        for header in evidence_headers:
+            if not header:
+                continue
+            _, norm = self.validator.validate_and_score(header)
+            candidate = norm if norm else header
+            if candidate == target:
+                support += 1
+        return support
+
+    def _predict_zero_o_tesseract(self, glyph_img) -> Tuple[str, float]:
+        """
+        Char-level fallback OCR on a single glyph using whitelist O/0.
+        """
+        try:
+            import pytesseract
+            import cv2
+            import numpy as np
+        except Exception:
+            return "", 0.0
+
+        if glyph_img is None:
+            return "", 0.0
+
+        gray = glyph_img
+        if len(gray.shape) == 3:
+            gray = cv2.cvtColor(gray, cv2.COLOR_BGR2GRAY)
+        gray = gray.astype(np.uint8)
+        _thr, bin_img = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+
+        config = "--psm 10 --oem 3 -c tessedit_char_whitelist=O0"
+        try:
+            text = pytesseract.image_to_string(bin_img, lang="eng", config=config).strip().upper()
+        except Exception:
+            return "", 0.0
+
+        if not text:
+            return "", 0.0
+
+        char = text[0]
+        if char not in {"0", "O"}:
+            return "", 0.0
+
+        confidence = 0.0
+        try:
+            data = pytesseract.image_to_data(
+                bin_img,
+                lang="eng",
+                config=config,
+                output_type=pytesseract.Output.DICT,
+            )
+            conf_values = []
+            for raw in data.get("conf", []):
+                try:
+                    conf = float(raw)
+                except Exception:
+                    continue
+                if conf >= 0:
+                    conf_values.append(conf)
+            if conf_values:
+                confidence = max(conf_values)
+        except Exception:
+            confidence = 0.0
+
+        min_conf = float(getattr(self.config, "code_char_tesseract_confidence_threshold", 72.0))
+        if confidence < min_conf:
+            return "", 0.0
+        return char, confidence
 
     def _refine_code_zero_o_with_glyph_width(
         self,
@@ -500,6 +816,19 @@ class OCRPipeline:
         """
         Extract per-character width for aligned OCR string indices using Tesseract boxes.
         """
+        boxes = self._extract_char_boxes(header_text, image)
+        if not boxes:
+            return {}
+        return {idx: float(max(1, box[2] - box[0])) for idx, box in boxes.items()}
+
+    def _extract_char_boxes(
+        self,
+        header_text: str,
+        image: Image.Image,
+    ) -> Dict[int, Tuple[int, int, int, int]]:
+        """
+        Map header character index -> bounding box (x1, y1, x2, y2).
+        """
         try:
             import pytesseract
             import cv2
@@ -511,43 +840,151 @@ class OCRPipeline:
             img_cv = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR)
             gray = cv2.cvtColor(img_cv, cv2.COLOR_BGR2GRAY)
             _thr, bin_img = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-            custom_config = self._get_tesseract_configs()[0][1]
-            boxes_str = pytesseract.image_to_boxes(bin_img, lang="eng", config=custom_config)
+            h, w = bin_img.shape[:2]
         except Exception:
             return {}
 
-        boxes = []
-        for line in (boxes_str or "").splitlines():
-            parts = line.strip().split()
-            if len(parts) < 5:
-                continue
-            ch = parts[0]
+        configs = [cfg for _psm, cfg in self._get_tesseract_configs()]
+        for psm in (10, 6, 7, 13):
+            cfg = f"--psm {psm} --oem 3 -c tessedit_char_whitelist={self.config.tesseract_char_whitelist}"
+            if cfg not in configs:
+                configs.append(cfg)
+
+        min_ratio = max(0.05, float(getattr(self.config, "code_box_alignment_min_match_ratio", 0.35)))
+        best_boxes: Dict[int, Tuple[int, int, int, int]] = {}
+        best_ratio = 0.0
+        target = header_text.strip()
+        target_len = max(1, len(target))
+
+        for custom_config in configs:
             try:
-                x1 = int(parts[1])
-                x2 = int(parts[3])
+                boxes_str = pytesseract.image_to_boxes(bin_img, lang="eng", config=custom_config)
             except Exception:
                 continue
-            boxes.append((ch, float(max(1, x2 - x1))))
+            if not boxes_str:
+                continue
 
-        if not boxes:
+            parsed_boxes: List[Tuple[str, int, int, int, int]] = []
+            for line in boxes_str.splitlines():
+                token = line.strip().split()
+                if len(token) < 5:
+                    continue
+                ch = token[0]
+                try:
+                    x1 = int(token[1])
+                    y1 = int(token[2])
+                    x2 = int(token[3])
+                    y2 = int(token[4])
+                except Exception:
+                    continue
+
+                left = max(0, min(w - 1, x1))
+                right = max(left + 1, min(w, x2))
+                top = max(0, min(h - 1, h - y2))
+                bottom = max(top + 1, min(h, h - y1))
+                parsed_boxes.append((ch, left, top, right, bottom))
+
+            if not parsed_boxes:
+                continue
+
+            aligned = self._align_char_boxes_from_stream(target, parsed_boxes)
+            ratio = len(aligned) / target_len
+            if ratio > best_ratio:
+                best_ratio = ratio
+                best_boxes = aligned
+
+            if ratio >= 0.90:
+                break
+
+        if best_ratio < min_ratio:
+            return {}
+        return best_boxes
+
+    def _align_char_boxes_from_stream(
+        self,
+        target: str,
+        parsed_boxes: List[Tuple[str, int, int, int, int]],
+    ) -> Dict[int, Tuple[int, int, int, int]]:
+        """
+        Align target header characters to OCR box stream with ambiguity-tolerant canonicalization.
+        """
+        if not target or not parsed_boxes:
             return {}
 
-        target = header_text.strip()
-        index_width: Dict[int, float] = {}
-        i = 0
-        j = 0
-        while i < len(target) and j < len(boxes):
-            target_ch = target[i]
-            box_ch, width = boxes[j]
-            if target_ch == box_ch:
-                index_width[i] = width
-                i += 1
-                j += 1
-                continue
-            # Skip unmatched OCR box char; keep target index.
-            j += 1
+        box_text = "".join(ch for ch, _l, _t, _r, _b in parsed_boxes)
+        norm_target = self._canonicalize_for_box_alignment(target)
+        norm_box_text = self._canonicalize_for_box_alignment(box_text)
 
-        return index_width
+        index_boxes: Dict[int, Tuple[int, int, int, int]] = {}
+        matcher = SequenceMatcher(None, norm_target, norm_box_text, autojunk=False)
+        for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+            if tag != "equal":
+                continue
+            span = min(i2 - i1, j2 - j1)
+            for k in range(span):
+                _ch, left, top, right, bottom = parsed_boxes[j1 + k]
+                index_boxes[i1 + k] = (left, top, right, bottom)
+        return index_boxes
+
+    def _canonicalize_for_box_alignment(self, text: str) -> str:
+        if not text:
+            return ""
+        mapping = self._box_alignment_map
+        return "".join(mapping.get(ch.upper(), ch.upper()) for ch in text)
+
+    @staticmethod
+    def _build_box_alignment_map(raw_pairs: str) -> Dict[str, str]:
+        """
+        Build canonical mapping for tolerant alignment.
+        Example: O:0,S:5,F:E => O/0->0, S/5->5, F/E->E
+        """
+        mapping: Dict[str, str] = {}
+        if not raw_pairs:
+            return mapping
+
+        for token in str(raw_pairs).split(","):
+            pair = token.strip().upper()
+            if ":" not in pair:
+                continue
+            left, right = pair.split(":", 1)
+            left = left.strip()
+            right = right.strip()
+            if len(left) != 1 or len(right) != 1:
+                continue
+            mapping[left] = right
+            mapping[right] = right
+        return mapping
+
+    def _crop_char(
+        self,
+        image: Image.Image,
+        box: Tuple[int, int, int, int],
+    ):
+        try:
+            import cv2
+            import numpy as np
+        except Exception:
+            return None
+
+        x1, y1, x2, y2 = box
+        if x2 <= x1 or y2 <= y1:
+            return None
+
+        img_cv = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR)
+        gray = cv2.cvtColor(img_cv, cv2.COLOR_BGR2GRAY)
+        h, w = gray.shape[:2]
+
+        pad_ratio = float(getattr(self.config, "code_char_box_padding_ratio", 0.18))
+        pad = max(1, int(max(x2 - x1, y2 - y1) * pad_ratio))
+
+        xx1 = max(0, x1 - pad)
+        yy1 = max(0, y1 - pad)
+        xx2 = min(w, x2 + pad)
+        yy2 = min(h, y2 + pad)
+        if xx2 <= xx1 or yy2 <= yy1:
+            return None
+
+        return gray[yy1:yy2, xx1:xx2]
 
     @staticmethod
     def _select_cross_scale_result(candidates: List[Dict]) -> Dict:
@@ -604,6 +1041,7 @@ class OCRPipeline:
                 "exact_count": exact_count,
                 "similarity_support": similarity_support,
                 "similarity_sum": similarity_sum,
+                "shape_fitness": int(candidate.get("shape_fitness", 0)),
             })
 
         prepared.sort(
@@ -611,6 +1049,7 @@ class OCRPipeline:
                 x["strict_valid"],
                 x["exact_count"],
                 x["similarity_support"],
+                x["shape_fitness"],
                 x["score"],
                 x["freq_ratio"],
                 x["similarity_sum"],
@@ -621,6 +1060,26 @@ class OCRPipeline:
             reverse=True,
         )
         return prepared[0]
+
+    def _is_suspicious_for_early_exit(self, header_text: str) -> Tuple[bool, str]:
+        """
+        Guard early exit for structurally suspicious but strict-valid headers.
+        """
+        if not header_text:
+            return False, ""
+
+        _, normalized = self.validator.validate_and_score(header_text)
+        text = normalized if normalized else header_text
+        parts = text.split(self.config.expected_separator)
+        if len(parts) != self.config.expected_parts:
+            return False, ""
+
+        _prefix, country, _code, _serial = parts
+        if len(country) > self.config.pattern_country_max:
+            return True, f"country_len={len(country)}>{self.config.pattern_country_max}"
+        if country.startswith("C") and len(country) == self.config.pattern_country_max + 1:
+            return True, "country_leading_C"
+        return False, ""
     
     def _run_ocr_methods(
         self,

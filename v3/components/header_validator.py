@@ -89,6 +89,26 @@ class HeaderValidator:
 
         parts_a = a.split(self.config.expected_separator)
         parts_b = b.split(self.config.expected_separator)
+        norm_threshold = threshold / 100.0 if threshold > 1.0 else threshold
+
+        strict_a = len(parts_a) >= self.config.min_expected_parts and self._valid_serial(parts_a[-1])
+        strict_b = len(parts_b) >= self.config.min_expected_parts and self._valid_serial(parts_b[-1])
+
+        # Strict-vs-strict guard:
+        # 1) Different serials must never be merged.
+        # 2) Same serial may merge with very high similarity for OCR drift in middle segments.
+        if strict_a and strict_b and len(parts_a) >= 3 and len(parts_b) >= 3:
+            serial_a = parts_a[-1]
+            serial_b = parts_b[-1]
+            if serial_a != serial_b:
+                return False
+
+            if parts_a[:-1] == parts_b[:-1]:
+                return True
+
+            strict_similarity_threshold = max(norm_threshold, 0.93)
+            similarity = SequenceMatcher(None, a, b).ratio()
+            return similarity >= strict_similarity_threshold
 
         # Serial-based matching: if both headers are high-confidence, require exact
         # serial match to avoid merging different documents with similar serials.
@@ -98,12 +118,6 @@ class HeaderValidator:
             if prefix_a == prefix_b:
                 serial_a = parts_a[-1]
                 serial_b = parts_b[-1]
-                strict_a = self._valid_serial(serial_a)
-                strict_b = self._valid_serial(serial_b)
-
-                # Both strict: must be exact serial match.
-                if strict_a and strict_b:
-                    return serial_a == serial_b
 
                 # One strict + one weak: allow close match for OCR drift correction.
                 if strict_a != strict_b and self._serials_close(serial_a, serial_b):
@@ -117,7 +131,6 @@ class HeaderValidator:
                 return False
 
         similarity = SequenceMatcher(None, a, b).ratio()
-        norm_threshold = threshold / 100.0 if threshold > 1.0 else threshold
         return similarity >= norm_threshold
 
     def _normalize(self, text: str) -> str:
@@ -200,11 +213,16 @@ class HeaderValidator:
             elif len(prefix) <= 2 and prefix.isalnum():
                 score += 8
 
-            # Keep middle segments flexible because some docs hide country/code semantics.
-            if 1 <= len(country) <= 6 and country.isalnum():
+            # Middle segments: prefer configured ranges, but allow reduced score outside range.
+            if self.config.pattern_country_min <= len(country) <= self.config.pattern_country_max and country.isalpha():
                 score += 12
-            if 1 <= len(code) <= 6 and code.isalnum():
+            elif 1 <= len(country) <= 6 and country.isalnum():
+                score += 4
+
+            if self.config.pattern_code_min <= len(code) <= self.config.pattern_code_max and code.isalnum():
                 score += 15
+            elif 1 <= len(code) <= 8 and code.isalnum():
+                score += 6
 
             if self._valid_serial(serial):
                 score += 35
@@ -232,6 +250,59 @@ class HeaderValidator:
             return score
 
         return score
+
+    def header_shape_fitness(self, text: str) -> int:
+        """
+        Compute how well a normalized header fits expected segment shapes.
+        Higher score = more likely structurally correct.
+        """
+        _, normalized = self.validate_and_score(text)
+        if not normalized:
+            return 0
+
+        parts = normalized.split(self.config.expected_separator)
+        fitness = 0
+
+        if len(parts) == self.config.expected_parts:
+            prefix, country, code, serial = parts[0], parts[1], parts[2], parts[3]
+            if len(prefix) == self.config.pattern_prefix_length and prefix.isalpha():
+                fitness += 20
+            elif prefix.isalnum():
+                fitness += 6
+
+            if self.config.pattern_country_min <= len(country) <= self.config.pattern_country_max and country.isalpha():
+                fitness += 30
+            elif country.isalpha() and len(country) == self.config.pattern_country_max + 1:
+                fitness += 6
+            elif country.isalnum():
+                fitness += 4
+
+            if self.config.pattern_code_min <= len(code) <= self.config.pattern_code_max and code.isalnum():
+                fitness += 25
+            elif code.isalnum():
+                fitness += 6
+
+            if self._valid_serial(serial):
+                fitness += 25
+            return fitness
+
+        if len(parts) == self.config.min_expected_parts:
+            prefix, middle, serial = parts[0], parts[1], parts[2]
+            if len(prefix) == self.config.pattern_prefix_length and prefix.isalpha():
+                fitness += 20
+            elif prefix.isalnum():
+                fitness += 6
+
+            if 1 <= len(middle) <= max(self.config.pattern_code_max, self.config.pattern_country_max + 2) and middle.isalnum():
+                fitness += 25
+            elif middle.isalnum():
+                fitness += 6
+
+            if self._valid_serial(serial):
+                fitness += 25
+            return fitness
+
+        return fitness
 
     def _valid_serial(self, serial: str) -> bool:
         if not serial:
@@ -400,6 +471,10 @@ class HeaderValidator:
         for idx, ch in enumerate(text):
             mapped = mapping.get(ch)
             if not mapped:
+                continue
+            # Conservative guard: do not convert leading numeric code char to alphabetic
+            # (prevents false changes like 0AJ -> OAJ, 0P7 -> OP7).
+            if idx == 0 and ch.isdigit() and mapped.isalpha():
                 continue
             variant = f"{text[:idx]}{mapped}{text[idx + 1:]}"
             if variant == text:

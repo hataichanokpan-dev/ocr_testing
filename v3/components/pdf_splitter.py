@@ -618,16 +618,21 @@ class PdfSplitter:
             score, corrected = self.validator.validate_and_score(header)
             normalized = corrected if corrected else header
             strict_valid = self.validator.is_strict_header(normalized)
+            shape_fitness = self.validator.header_shape_fitness(normalized)
 
             if normalized not in candidates:
                 candidates[normalized] = {
                     "count": 0,
                     "best_score": score,
                     "strict_valid": 1 if strict_valid else 0,
+                    "shape_fitness": shape_fitness,
                 }
             candidates[normalized]["count"] += 1
             candidates[normalized]["best_score"] = max(
                 candidates[normalized]["best_score"], score
+            )
+            candidates[normalized]["shape_fitness"] = max(
+                candidates[normalized]["shape_fitness"], shape_fitness
             )
             if strict_valid:
                 candidates[normalized]["strict_valid"] = 1
@@ -635,13 +640,13 @@ class PdfSplitter:
         ranked = sorted(
             candidates.items(),
             key=lambda item: (
-                item[1]["count"],
-                item[1]["strict_valid"],
-                item[1]["best_score"],
+                -item[1]["count"],
+                -item[1]["strict_valid"],
+                -item[1]["shape_fitness"],
+                -item[1]["best_score"],
                 len(item[0]),
                 item[0],
             ),
-            reverse=True,
         )
         return ranked[0][0]
     

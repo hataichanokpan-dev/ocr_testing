@@ -39,6 +39,7 @@ print(f"RESULT:")
 print(f"  Headers extracted: {result.get('headers_extracted', 0)}")
 print(f"  Split PDFs: {result.get('split_pdfs_created', 0)}")
 print(f"  Processing time: {result.get('metrics', {}).get('processing_time_seconds', 0):.2f}s")
+
 print(f"{'='*60}\n")
 
 # Cleanup

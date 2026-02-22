@@ -139,12 +139,32 @@ class ExtractionConfig:
     enable_code_ambiguity_monitor: bool = True
     code_ambiguity_pairs: str = 'O:0'
     code_ambiguity_only_mixed_alnum: bool = True
-    enable_code_ambiguity_autocorrect: bool = True
+    enable_code_ambiguity_autocorrect: bool = False
     code_autocorrect_min_support: int = 1
     code_autocorrect_require_scale_evidence: bool = True
     code_autocorrect_force_multi_scale: bool = True
+    enable_code_anchor_harmonize: bool = True
+    code_anchor_harmonize_min_glyph_support: int = 1
     enable_code_glyph_disambiguation: bool = True
     code_zero_to_o_width_ratio: float = 1.12
+    enable_code_char_classifier: bool = True
+    code_char_classifier_min_confidence: float = 0.72
+    code_char_classifier_min_margin: float = 0.12
+    code_char_classifier_allow_leading_zero_to_o: bool = False
+    code_char_classifier_enable_width_vote: bool = True
+    code_char_classifier_min_vote_support: int = 2
+    code_char_classifier_require_evidence: bool = False
+    code_char_classifier_min_evidence_support: int = 2
+    code_char_tesseract_confidence_threshold: float = 72.0
+    code_char_box_padding_ratio: float = 0.18
+    enable_code_glyph_width_fallback: bool = False
+    enable_code_ambiguity_confirm_high_scale: bool = True
+    code_ambiguity_confirm_scale: float = 6.0
+    code_box_alignment_ambiguity_pairs: str = 'O:0,S:5,F:E'
+    code_box_alignment_min_match_ratio: float = 0.35
+    enable_code_anchor_rescue_pass: bool = True
+    code_anchor_rescue_scale: float = 7.5
+    code_anchor_rescue_only_on_no_char_boxes: bool = True
     
     def __post_init__(self):
         """Validate configuration after initialization"""
@@ -324,12 +344,32 @@ class ConfigManager:
             enable_code_ambiguity_monitor=settings.getboolean('enable_code_ambiguity_monitor', True),
             code_ambiguity_pairs=settings.get('code_ambiguity_pairs', 'O:0'),
             code_ambiguity_only_mixed_alnum=settings.getboolean('code_ambiguity_only_mixed_alnum', True),
-            enable_code_ambiguity_autocorrect=settings.getboolean('enable_code_ambiguity_autocorrect', True),
+            enable_code_ambiguity_autocorrect=settings.getboolean('enable_code_ambiguity_autocorrect', False),
             code_autocorrect_min_support=settings.getint('code_autocorrect_min_support', 1),
             code_autocorrect_require_scale_evidence=settings.getboolean('code_autocorrect_require_scale_evidence', True),
             code_autocorrect_force_multi_scale=settings.getboolean('code_autocorrect_force_multi_scale', True),
+            enable_code_anchor_harmonize=settings.getboolean('enable_code_anchor_harmonize', True),
+            code_anchor_harmonize_min_glyph_support=settings.getint('code_anchor_harmonize_min_glyph_support', 1),
             enable_code_glyph_disambiguation=settings.getboolean('enable_code_glyph_disambiguation', True),
             code_zero_to_o_width_ratio=settings.getfloat('code_zero_to_o_width_ratio', 1.12),
+            enable_code_char_classifier=settings.getboolean('enable_code_char_classifier', True),
+            code_char_classifier_min_confidence=settings.getfloat('code_char_classifier_min_confidence', 0.72),
+            code_char_classifier_min_margin=settings.getfloat('code_char_classifier_min_margin', 0.12),
+            code_char_classifier_allow_leading_zero_to_o=settings.getboolean('code_char_classifier_allow_leading_zero_to_o', False),
+            code_char_classifier_enable_width_vote=settings.getboolean('code_char_classifier_enable_width_vote', True),
+            code_char_classifier_min_vote_support=settings.getint('code_char_classifier_min_vote_support', 2),
+            code_char_classifier_require_evidence=settings.getboolean('code_char_classifier_require_evidence', False),
+            code_char_classifier_min_evidence_support=settings.getint('code_char_classifier_min_evidence_support', 2),
+            code_char_tesseract_confidence_threshold=settings.getfloat('code_char_tesseract_confidence_threshold', 72.0),
+            code_char_box_padding_ratio=settings.getfloat('code_char_box_padding_ratio', 0.18),
+            enable_code_glyph_width_fallback=settings.getboolean('enable_code_glyph_width_fallback', False),
+            enable_code_ambiguity_confirm_high_scale=settings.getboolean('enable_code_ambiguity_confirm_high_scale', True),
+            code_ambiguity_confirm_scale=settings.getfloat('code_ambiguity_confirm_scale', 6.0),
+            code_box_alignment_ambiguity_pairs=settings.get('code_box_alignment_ambiguity_pairs', 'O:0,S:5,F:E'),
+            code_box_alignment_min_match_ratio=settings.getfloat('code_box_alignment_min_match_ratio', 0.35),
+            enable_code_anchor_rescue_pass=settings.getboolean('enable_code_anchor_rescue_pass', True),
+            code_anchor_rescue_scale=settings.getfloat('code_anchor_rescue_scale', 7.5),
+            code_anchor_rescue_only_on_no_char_boxes=settings.getboolean('code_anchor_rescue_only_on_no_char_boxes', True),
         )
         
         logger.info(f"Configuration loaded from: {config_path}")

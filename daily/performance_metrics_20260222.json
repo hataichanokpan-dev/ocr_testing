@@ -1,5 +1,6 @@
 {
   "format_version": "2.0",
+  "day": "2026-02-22",
   "summary": {
     "total_jobs": 1,
     "active_jobs": 0,
@@ -16,8 +17,8 @@
     "fastest_job": 116.95797419548035,
     "slowest_job": 116.95797419548035
   },
-  "timestamp": "2026-02-22T15:07:03.042273",
-  "completed_jobs": [
+  "exported_at": "2026-02-22T15:07:03.043281",
+  "jobs": [
     {
       "job_id": "354c8095",
       "filename": "xtest.pdf",

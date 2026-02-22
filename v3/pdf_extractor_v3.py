@@ -157,6 +157,7 @@ class PDFTextExtractorV3:
             
             # Extract headers from specified pages
             page_headers = []
+            page_quality_flags = {}
             for page_num in pages_to_process:
                 if page_num > total_pages:
                     logger.warning(f"Page {page_num} exceeds total pages ({total_pages})")
@@ -177,6 +178,7 @@ class PDFTextExtractorV3:
                 
                 if header_text:
                     page_headers.append((page_num - 1, header_text))  # Store 0-based
+                    page_quality_flags[page_num - 1] = ocr_info.get('quality_flags', '')
                     logger.info(f"[JOB {job_id}] Page {page_num} header: '{header_text}'")
                     
                     # Record to CSV
@@ -205,6 +207,54 @@ class PDFTextExtractorV3:
                         error_message='No header extracted',
                         quality_flags=ocr_info.get('quality_flags', '')
                     )
+
+            page_headers, rescue_updates = self._rescue_ambiguous_code_anchors(
+                doc=doc,
+                source_filename=Path(pdf_path).name,
+                job_id=job_id,
+                page_headers=page_headers,
+                page_quality_flags=page_quality_flags,
+            )
+            if rescue_updates:
+                for record in self.csv_reporter.pending_records:
+                    page_idx = record.page_number - 1
+                    new_header = rescue_updates.get(page_idx)
+                    if not new_header:
+                        continue
+                    if record.header_extracted != new_header:
+                        logger.warning(
+                            f"[RESCUE] Page {record.page_number}: "
+                            f"'{record.header_extracted}' -> '{new_header}'"
+                        )
+                        record.header_extracted = new_header
+                        record.quality_flags = self._append_quality_flag(
+                            record.quality_flags,
+                            "code_anchor_rescued",
+                        )
+
+            if bool(getattr(self.config, "enable_code_anchor_harmonize", False)):
+                # Optional post-pass harmonization, disabled by default to avoid
+                # cross-page over-correction in mixed/random batches.
+                page_headers, header_updates = self._harmonize_code_ambiguity_headers(
+                    page_headers,
+                    page_quality_flags,
+                )
+                if header_updates:
+                    for record in self.csv_reporter.pending_records:
+                        page_idx = record.page_number - 1
+                        new_header = header_updates.get(page_idx)
+                        if not new_header:
+                            continue
+                        if record.header_extracted != new_header:
+                            logger.warning(
+                                f"[HARMONIZE] Page {record.page_number}: "
+                                f"'{record.header_extracted}' -> '{new_header}'"
+                            )
+                            record.header_extracted = new_header
+                            record.quality_flags = self._append_quality_flag(
+                                record.quality_flags,
+                                "code_anchor_harmonized",
+                            )
             
             doc.close()
             
@@ -268,6 +318,9 @@ class PDFTextExtractorV3:
             logger.info(f"  Split PDFs created: {len(split_results)}")
             if metrics:
                 logger.info(f"  Processing time: {metrics.processing_time_seconds:.2f}s")
+                logger.info(f"  Average confidence: {summary_stats['avg_confidence']:.2f}")
+                logger.info(f"  Pages with code ambiguity: {summary_stats['code_ambiguity_pages']}")
+                logger.info(f"  Avg page processing time: {metrics.processing_time_seconds / total_pages:.2f}s")
             if csv_path:
                 logger.info(f"  CSV Report: {csv_path}")
             
@@ -363,9 +416,28 @@ class PDFTextExtractorV3:
                 ocr_info['method'] = list(method_results.keys())[0] if method_results else 'unknown'
                 # Get render scale from context (default to 2.0)
                 ocr_info['render_scale'] = 2.0  # Would need to track this from adaptive rendering
+
+                meta = method_results.get("__meta__", {}) if isinstance(method_results, dict) else {}
+                reason = str(meta.get("glyph_disambiguation_reason", "")).strip()
+                ocr_info["glyph_disambiguation_reason"] = reason
+                if meta.get("glyph_disambiguated"):
+                    flag = "glyph_disambiguated" if not reason else f"glyph_disambiguated:{reason}"
+                    ocr_info['quality_flags'] = self._append_quality_flag(
+                        ocr_info.get('quality_flags', ''),
+                        flag,
+                    )
+                elif reason:
+                    ocr_info['quality_flags'] = self._append_quality_flag(
+                        ocr_info.get('quality_flags', ''),
+                        f"glyph_disambiguation_skipped:{reason}",
+                    )
+
                 ambiguity_flag = self._build_code_ambiguity_flag(text, page_num)
                 if ambiguity_flag:
-                    ocr_info['quality_flags'] = ambiguity_flag
+                    ocr_info['quality_flags'] = self._append_quality_flag(
+                        ocr_info.get('quality_flags', ''),
+                        ambiguity_flag,
+                    )
             
             # Log to API
             if self.config.enable_api_logging:
@@ -412,6 +484,272 @@ class PDFTextExtractorV3:
             f"(alternatives: {alt_preview})"
         )
         return f"code_ambiguity:{code_segment}->{alt_preview}"
+
+    def _append_quality_flag(self, existing: str, new_flag: str) -> str:
+        """Append quality flag without duplicating tokens."""
+        new_flag = str(new_flag or "").strip()
+        if not new_flag:
+            return existing or ""
+        existing_tokens = [token.strip() for token in str(existing or "").split(";") if token.strip()]
+        if new_flag in existing_tokens:
+            return ";".join(existing_tokens)
+        existing_tokens.append(new_flag)
+        return ";".join(existing_tokens)
+
+    def _harmonize_code_ambiguity_headers(
+        self,
+        page_headers: List[Tuple[int, str]],
+        page_quality_flags: dict,
+    ) -> Tuple[List[Tuple[int, str]], dict]:
+        """
+        Harmonize O/0 variants inside the same document using serial anchor evidence.
+
+        Strategy:
+        - Build anchor key with code signature (O->0), prefix/country and serial.
+        - If multiple code variants exist for same anchor, choose canonical by:
+          1) glyph_disambiguated support
+          2) frequency
+          3) presence of letter O
+        """
+        if not page_headers:
+            return page_headers, {}
+
+        variants_by_anchor = {}
+        normalized_cache = {}
+
+        for page_idx, header in page_headers:
+            _, normalized = self.validator.validate_and_score(header)
+            norm = normalized if normalized else header
+            normalized_cache[page_idx] = norm
+
+            parts = norm.split(self.config.expected_separator)
+            code_idx = self._resolve_code_index(parts)
+            if code_idx is None:
+                continue
+
+            code = parts[code_idx]
+            if "0" not in code and "O" not in code:
+                continue
+
+            signature = code.replace("O", "0")
+            anchor = self._build_code_anchor(parts, code_idx, signature)
+            if anchor is None:
+                continue
+
+            entry = variants_by_anchor.setdefault(anchor, {})
+            bucket = entry.setdefault(code, {"count": 0, "glyph": 0, "pages": []})
+            bucket["count"] += 1
+            flags = str(page_quality_flags.get(page_idx, "") or "")
+            if "glyph_disambiguated" in flags:
+                bucket["glyph"] += 1
+            bucket["pages"].append(page_idx)
+
+        canonical_by_anchor = {}
+        min_glyph_support = max(
+            1,
+            int(getattr(self.config, "code_anchor_harmonize_min_glyph_support", 1)),
+        )
+        for anchor, code_map in variants_by_anchor.items():
+            if len(code_map) <= 1:
+                continue
+
+            ranked = sorted(
+                code_map.items(),
+                key=lambda item: (
+                    -item[1]["glyph"],
+                    -item[1]["count"],
+                    item[0],
+                ),
+            )
+
+            top_code, top_meta = ranked[0]
+            top_glyph = int(top_meta.get("glyph", 0))
+            if top_glyph < min_glyph_support:
+                # No strong per-page glyph evidence => do not harmonize this anchor.
+                continue
+
+            if len(ranked) > 1:
+                second_code, second_meta = ranked[1]
+                if (
+                    int(second_meta.get("glyph", 0)) == top_glyph
+                    and int(second_meta.get("count", 0)) == int(top_meta.get("count", 0))
+                ):
+                    logger.info(
+                        f"[HARMONIZE] Skip anchor due to tie ({top_code} vs {second_code})"
+                    )
+                    continue
+
+            canonical_by_anchor[anchor] = top_code
+
+        if not canonical_by_anchor:
+            return [(idx, normalized_cache[idx]) for idx, _ in page_headers], {}
+
+        updates = {}
+        updated_headers: List[Tuple[int, str]] = []
+        for page_idx, _header in page_headers:
+            norm = normalized_cache.get(page_idx, _header)
+            parts = norm.split(self.config.expected_separator)
+            code_idx = self._resolve_code_index(parts)
+            if code_idx is None:
+                updated_headers.append((page_idx, norm))
+                continue
+
+            signature = parts[code_idx].replace("O", "0")
+            anchor = self._build_code_anchor(parts, code_idx, signature)
+            canonical = canonical_by_anchor.get(anchor) if anchor is not None else None
+            if canonical and parts[code_idx] != canonical:
+                parts[code_idx] = canonical
+                norm = self.config.expected_separator.join(parts)
+                updates[page_idx] = norm
+
+            updated_headers.append((page_idx, norm))
+
+        return updated_headers, updates
+
+    def _rescue_ambiguous_code_anchors(
+        self,
+        doc,
+        source_filename: str,
+        job_id: str,
+        page_headers: List[Tuple[int, str]],
+        page_quality_flags: dict,
+    ) -> Tuple[List[Tuple[int, str]], dict]:
+        """
+        Rescue unresolved O/0 ambiguity for anchors that still have no char boxes.
+        Runs one high-scale rescue per anchor, then propagates code segment inside anchor.
+        """
+        if not page_headers:
+            return page_headers, {}
+        if not bool(getattr(self.config, "enable_code_anchor_rescue_pass", True)):
+            return page_headers, {}
+
+        normalized_cache = {}
+        anchors = {}
+
+        for page_idx, header in page_headers:
+            _, normalized = self.validator.validate_and_score(header)
+            norm = normalized if normalized else header
+            normalized_cache[page_idx] = norm
+
+            ambiguity = self.validator.inspect_code_ambiguity(norm)
+            if not ambiguity.get("is_ambiguous"):
+                continue
+
+            parts = norm.split(self.config.expected_separator)
+            code_idx = self._resolve_code_index(parts)
+            if code_idx is None:
+                continue
+            signature = parts[code_idx].replace("O", "0")
+            anchor = self._build_code_anchor(parts, code_idx, signature)
+            if anchor is None:
+                continue
+
+            flags = str(page_quality_flags.get(page_idx, "") or "")
+            anchors.setdefault(anchor, []).append((page_idx, norm, flags))
+
+        updates = {}
+        rescue_only_no_boxes = bool(
+            getattr(self.config, "code_anchor_rescue_only_on_no_char_boxes", True)
+        )
+
+        for anchor, items in anchors.items():
+            if not items:
+                continue
+            if any("glyph_disambiguated" in flags for _idx, _h, flags in items):
+                # Already resolved by per-page disambiguation.
+                continue
+
+            if rescue_only_no_boxes and not any(
+                "glyph_disambiguation_skipped:no_char_boxes" in flags for _idx, _h, flags in items
+            ):
+                continue
+
+            candidate_page_idx = None
+            for page_idx, _header, flags in items:
+                if "glyph_disambiguation_skipped:no_char_boxes" in flags:
+                    candidate_page_idx = page_idx
+                    break
+            if candidate_page_idx is None:
+                candidate_page_idx = items[0][0]
+
+            page = doc[candidate_page_idx]
+            rect = self._compute_header_rect(page)
+            base_header = normalized_cache.get(candidate_page_idx, items[0][1])
+
+            context = OCRContext(
+                filename=source_filename,
+                page_num=candidate_page_idx + 1,
+                job_id=job_id,
+            )
+            rescued, reason = self.ocr_pipeline.rescue_ambiguous_header(
+                page=page,
+                rect=rect,
+                context=context,
+                base_header=base_header,
+            )
+
+            if rescued == base_header:
+                logger.info(
+                    f"[RESCUE] Anchor page {candidate_page_idx + 1}: no change ({reason})"
+                )
+                continue
+
+            rescued_parts = rescued.split(self.config.expected_separator)
+            rescued_code_idx = self._resolve_code_index(rescued_parts)
+            if rescued_code_idx is None:
+                continue
+            rescued_code = rescued_parts[rescued_code_idx]
+
+            for page_idx, old_header, _flags in items:
+                old_parts = old_header.split(self.config.expected_separator)
+                old_code_idx = self._resolve_code_index(old_parts)
+                if old_code_idx is None:
+                    continue
+                if old_parts[old_code_idx] == rescued_code:
+                    continue
+                old_parts[old_code_idx] = rescued_code
+                new_header = self.config.expected_separator.join(old_parts)
+                normalized_cache[page_idx] = new_header
+                updates[page_idx] = new_header
+                logger.warning(
+                    f"[RESCUE] Page {page_idx + 1}: '{old_header}' -> '{new_header}' ({reason})"
+                )
+
+        updated_headers = []
+        for page_idx, header in page_headers:
+            updated_headers.append((page_idx, normalized_cache.get(page_idx, header)))
+        return updated_headers, updates
+
+    def _compute_header_rect(self, page):
+        """Compute configured header extraction rectangle for a page."""
+        page_rect = page.rect
+        page_height = page_rect.height
+        page_width = page_rect.width
+
+        top = (self.config.header_area_top / 100) * page_height
+        left = (self.config.header_area_left / 100) * page_width
+        width = (self.config.header_area_width / 100) * page_width
+        height = (self.config.header_area_height / 100) * page_height
+        return fitz.Rect(left, top, left + width, top + height)
+
+    def _resolve_code_index(self, parts: List[str]) -> Optional[int]:
+        if len(parts) == self.config.expected_parts:
+            return 2
+        if len(parts) == self.config.min_expected_parts:
+            return 1
+        return None
+
+    def _build_code_anchor(self, parts: List[str], code_idx: int, code_signature: str):
+        if code_idx >= len(parts):
+            return None
+        anchor_parts = list(parts)
+        anchor_parts[code_idx] = code_signature
+        return (
+            len(anchor_parts),
+            code_idx,
+            *anchor_parts[:code_idx],
+            *anchor_parts[code_idx + 1 :],
+        )
     
     def shutdown(self):
         """Gracefully shutdown extractor"""
