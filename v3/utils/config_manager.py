@@ -64,6 +64,8 @@ class ExtractionConfig:
     max_ocr_attempts: int = 8
     early_exit_score: int = 90
     voting_method_score_threshold: int = 70
+    ocr_method_early_exit_min_attempts: int = 2
+    ocr_method_early_exit_min_confirmations: int = 2
     
     # OCR optimization
     ocr_filter_black_text: bool = True
@@ -137,8 +139,9 @@ class ExtractionConfig:
 
     # Code ambiguity monitoring (observe-only, V3.3)
     enable_code_ambiguity_monitor: bool = True
-    code_ambiguity_pairs: str = 'O:0'
+    code_ambiguity_pairs: str = 'O:0,I:L'
     code_ambiguity_only_mixed_alnum: bool = True
+    code_ambiguity_allow_same_type_pairs: bool = True
     enable_code_ambiguity_autocorrect: bool = False
     code_autocorrect_min_support: int = 1
     code_autocorrect_require_scale_evidence: bool = True
@@ -153,6 +156,7 @@ class ExtractionConfig:
     code_char_classifier_allow_leading_zero_to_o: bool = False
     code_char_classifier_enable_width_vote: bool = True
     code_char_classifier_min_vote_support: int = 2
+    code_char_classifier_max_positions: int = 4
     code_char_classifier_require_evidence: bool = False
     code_char_classifier_min_evidence_support: int = 2
     code_char_tesseract_confidence_threshold: float = 72.0
@@ -160,7 +164,12 @@ class ExtractionConfig:
     enable_code_glyph_width_fallback: bool = False
     enable_code_ambiguity_confirm_high_scale: bool = True
     code_ambiguity_confirm_scale: float = 6.0
-    code_box_alignment_ambiguity_pairs: str = 'O:0,S:5,F:E'
+    enable_code_ambiguity_full_ocr_confirm: bool = True
+    code_ambiguity_full_ocr_confirm_min_support: int = 2
+    enable_code_image_support_rescue: bool = True
+    code_image_support_min_votes: int = 1
+    code_image_support_max_attempts: int = 6
+    code_box_alignment_ambiguity_pairs: str = 'O:0,S:5,F:E,I:L'
     code_box_alignment_min_match_ratio: float = 0.35
     enable_code_anchor_rescue_pass: bool = True
     code_anchor_rescue_scale: float = 7.5
@@ -269,6 +278,8 @@ class ConfigManager:
             max_ocr_attempts=settings.getint('max_ocr_attempts', 8),
             early_exit_score=settings.getint('early_exit_score', 90),
             voting_method_score_threshold=settings.getint('voting_method_score_threshold', 70),
+            ocr_method_early_exit_min_attempts=settings.getint('ocr_method_early_exit_min_attempts', 2),
+            ocr_method_early_exit_min_confirmations=settings.getint('ocr_method_early_exit_min_confirmations', 2),
             
             # OCR optimization
             ocr_filter_black_text=settings.getboolean('ocr_filter_black_text', True),
@@ -342,8 +353,9 @@ class ConfigManager:
 
             # Code ambiguity monitoring (observe-only)
             enable_code_ambiguity_monitor=settings.getboolean('enable_code_ambiguity_monitor', True),
-            code_ambiguity_pairs=settings.get('code_ambiguity_pairs', 'O:0'),
+            code_ambiguity_pairs=settings.get('code_ambiguity_pairs', 'O:0,I:L'),
             code_ambiguity_only_mixed_alnum=settings.getboolean('code_ambiguity_only_mixed_alnum', True),
+            code_ambiguity_allow_same_type_pairs=settings.getboolean('code_ambiguity_allow_same_type_pairs', True),
             enable_code_ambiguity_autocorrect=settings.getboolean('enable_code_ambiguity_autocorrect', False),
             code_autocorrect_min_support=settings.getint('code_autocorrect_min_support', 1),
             code_autocorrect_require_scale_evidence=settings.getboolean('code_autocorrect_require_scale_evidence', True),
@@ -358,6 +370,7 @@ class ConfigManager:
             code_char_classifier_allow_leading_zero_to_o=settings.getboolean('code_char_classifier_allow_leading_zero_to_o', False),
             code_char_classifier_enable_width_vote=settings.getboolean('code_char_classifier_enable_width_vote', True),
             code_char_classifier_min_vote_support=settings.getint('code_char_classifier_min_vote_support', 2),
+            code_char_classifier_max_positions=settings.getint('code_char_classifier_max_positions', 4),
             code_char_classifier_require_evidence=settings.getboolean('code_char_classifier_require_evidence', False),
             code_char_classifier_min_evidence_support=settings.getint('code_char_classifier_min_evidence_support', 2),
             code_char_tesseract_confidence_threshold=settings.getfloat('code_char_tesseract_confidence_threshold', 72.0),
@@ -365,7 +378,12 @@ class ConfigManager:
             enable_code_glyph_width_fallback=settings.getboolean('enable_code_glyph_width_fallback', False),
             enable_code_ambiguity_confirm_high_scale=settings.getboolean('enable_code_ambiguity_confirm_high_scale', True),
             code_ambiguity_confirm_scale=settings.getfloat('code_ambiguity_confirm_scale', 6.0),
-            code_box_alignment_ambiguity_pairs=settings.get('code_box_alignment_ambiguity_pairs', 'O:0,S:5,F:E'),
+            enable_code_ambiguity_full_ocr_confirm=settings.getboolean('enable_code_ambiguity_full_ocr_confirm', True),
+            code_ambiguity_full_ocr_confirm_min_support=settings.getint('code_ambiguity_full_ocr_confirm_min_support', 2),
+            enable_code_image_support_rescue=settings.getboolean('enable_code_image_support_rescue', True),
+            code_image_support_min_votes=settings.getint('code_image_support_min_votes', 1),
+            code_image_support_max_attempts=settings.getint('code_image_support_max_attempts', 6),
+            code_box_alignment_ambiguity_pairs=settings.get('code_box_alignment_ambiguity_pairs', 'O:0,S:5,F:E,I:L'),
             code_box_alignment_min_match_ratio=settings.getfloat('code_box_alignment_min_match_ratio', 0.35),
             enable_code_anchor_rescue_pass=settings.getboolean('enable_code_anchor_rescue_pass', True),
             code_anchor_rescue_scale=settings.getfloat('code_anchor_rescue_scale', 7.5),

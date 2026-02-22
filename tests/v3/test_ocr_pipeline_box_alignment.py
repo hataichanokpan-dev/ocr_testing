@@ -14,8 +14,12 @@ from v3.utils.config_manager import ConfigManager
 def _pipeline_stub() -> OCRPipeline:
     pipeline = OCRPipeline.__new__(OCRPipeline)
     pipeline.config = ConfigManager.load_from_file("v3/config.ini")
+    pair_spec = OCRPipeline._merge_pair_specs(
+        pipeline.config.code_box_alignment_ambiguity_pairs,
+        pipeline.config.code_ambiguity_pairs,
+    )
     pipeline._box_alignment_map = OCRPipeline._build_box_alignment_map(
-        pipeline.config.code_box_alignment_ambiguity_pairs
+        pair_spec
     )
     return pipeline
 
@@ -43,3 +47,12 @@ def test_align_char_boxes_tolerates_s5_and_fe_substitution():
     ocr_stream = "B-FD-5E5-S18018435"
     aligned = pipeline._align_char_boxes_from_stream(target, _boxes_from_text(ocr_stream))
     assert len(aligned) >= len(target) - 2
+
+
+def test_align_char_boxes_tolerates_il_substitution_from_code_pairs():
+    pipeline = _pipeline_stub()
+    # Real regression: target selected as UEL while OCR stream char boxes can read UEI.
+    target = "B-TW-UEL-S18011737"
+    ocr_stream = "B-TW-UEI-S18011737"
+    aligned = pipeline._align_char_boxes_from_stream(target, _boxes_from_text(ocr_stream))
+    assert 7 in aligned

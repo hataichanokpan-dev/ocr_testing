@@ -422,15 +422,8 @@ class HeaderValidator:
             result["note"] = "empty_code"
             return result
 
-        only_mixed = bool(getattr(self.config, "code_ambiguity_only_mixed_alnum", True))
-        has_alpha = any(ch.isalpha() for ch in code)
-        has_digit = any(ch.isdigit() for ch in code)
-        if only_mixed and not (has_alpha and has_digit):
-            result["note"] = "not_mixed_alnum"
-            return result
-
         pairs = self._parse_bidirectional_ambiguity_pairs(
-            getattr(self.config, "code_ambiguity_pairs", "O:0")
+            getattr(self.config, "code_ambiguity_pairs", "O:0,I:L")
         )
         if not pairs:
             result["note"] = "no_pairs"
@@ -441,6 +434,20 @@ class HeaderValidator:
             result["note"] = "no_variant"
             return result
 
+        only_mixed = bool(getattr(self.config, "code_ambiguity_only_mixed_alnum", True))
+        has_alpha = any(ch.isalpha() for ch in code)
+        has_digit = any(ch.isdigit() for ch in code)
+        if only_mixed and not (has_alpha and has_digit):
+            allow_same_type = bool(
+                getattr(self.config, "code_ambiguity_allow_same_type_pairs", True)
+            )
+            if not allow_same_type:
+                result["note"] = "not_mixed_alnum"
+                return result
+            if not self._has_same_type_ambiguity_candidate(code, pairs):
+                result["note"] = "not_mixed_alnum"
+                return result
+
         alt_headers: List[str] = []
         for alt_code in alt_codes:
             alt_parts = list(parts)
@@ -450,8 +457,19 @@ class HeaderValidator:
         result["is_ambiguous"] = True
         result["alternative_codes"] = alt_codes
         result["alternative_headers"] = alt_headers
-        result["note"] = "code_o0_ambiguous"
+        result["note"] = "code_confusable_ambiguous"
         return result
+
+    def _has_same_type_ambiguity_candidate(self, code: str, pairs: Dict[str, str]) -> bool:
+        for ch in code:
+            mapped = pairs.get(ch)
+            if not mapped:
+                continue
+            if ch.isalpha() and mapped.isalpha():
+                return True
+            if ch.isdigit() and mapped.isdigit():
+                return True
+        return False
 
     def _resolve_code_segment_index(self, parts: List[str]) -> Optional[int]:
         """Resolve likely customer code segment index based on header part count."""

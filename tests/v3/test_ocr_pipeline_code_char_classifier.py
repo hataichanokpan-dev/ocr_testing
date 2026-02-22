@@ -31,6 +31,9 @@ def _pipeline_stub() -> OCRPipeline:
     pipeline.config = ConfigManager.load_from_file("v3/config.ini")
     pipeline.validator = HeaderValidator(pipeline.config)
     pipeline._zero_o_classifier = _ClassifierStub("O", True)
+    pipeline._code_pair_map = OCRPipeline._build_bidirectional_pair_map(
+        pipeline.config.code_ambiguity_pairs
+    )
     return pipeline
 
 
@@ -42,7 +45,9 @@ def test_char_classifier_refines_internal_zero_to_o():
     # Header: B-FD-020H-S18020267 -> code starts at index 5, internal zero at index 7.
     pipeline._extract_char_boxes = lambda _text, _img: {7: (1, 1, 8, 8)}
     pipeline._crop_char = lambda _img, _box: object()
-    pipeline._predict_zero_o_tesseract = lambda _glyph: ("O", 91.0)
+    pipeline._predict_pair_tesseract_votes = (
+        lambda _glyph, _pair: ({"O": 2, "0": 0}, ["ocr=O@91.0"])
+    )
 
     refined, reason = pipeline._refine_code_zero_o_with_char_classifier(
         "B-FD-020H-S18020267",
@@ -60,13 +65,15 @@ def test_char_classifier_refines_internal_zero_to_o():
 
 def test_char_classifier_requires_min_vote_support():
     pipeline = _pipeline_stub()
-    pipeline.config.enable_code_char_classifier = True
+    pipeline.config.enable_code_char_classifier = False
     pipeline.config.enable_code_glyph_width_fallback = False
     pipeline.config.code_char_classifier_min_vote_support = 2
 
     pipeline._extract_char_boxes = lambda _text, _img: {7: (1, 1, 8, 8)}
     pipeline._crop_char = lambda _img, _box: object()
-    pipeline._predict_zero_o_tesseract = lambda _glyph: ("", 0.0)
+    pipeline._predict_pair_tesseract_votes = (
+        lambda _glyph, _pair: ({"O": 1, "0": 0}, ["ocr=O@80.0"])
+    )
 
     refined, reason = pipeline._refine_code_zero_o_with_char_classifier(
         "B-FD-020H-S18020267",
@@ -74,7 +81,7 @@ def test_char_classifier_requires_min_vote_support():
     )
 
     assert refined == "B-FD-020H-S18020267"
-    assert reason == "classifier_no_change"
+    assert reason.startswith("classifier_no_change")
 
 
 def test_char_classifier_does_not_flip_leading_zero():
@@ -86,7 +93,7 @@ def test_char_classifier_does_not_flip_leading_zero():
     # Only leading zero has box evidence; it must remain numeric.
     pipeline._extract_char_boxes = lambda _text, _img: {5: (1, 1, 8, 8)}
     pipeline._crop_char = lambda _img, _box: object()
-    pipeline._predict_zero_o_tesseract = lambda _glyph: ("", 0.0)
+    pipeline._predict_pair_tesseract_votes = lambda _glyph, _pair: ({}, [])
 
     refined, reason = pipeline._refine_code_zero_o_with_char_classifier(
         "B-FD-020H-S18020267",
@@ -94,7 +101,7 @@ def test_char_classifier_does_not_flip_leading_zero():
     )
 
     assert refined == "B-FD-020H-S18020267"
-    assert reason == "classifier_no_change"
+    assert reason.startswith("classifier_no_change")
 
 
 def test_char_classifier_falls_back_to_width_rule_when_no_boxes():
@@ -115,3 +122,52 @@ def test_char_classifier_falls_back_to_width_rule_when_no_boxes():
 
     assert refined == "B-FD-02OH-S18020267"
     assert "width_ratio" in reason
+
+
+def test_char_classifier_handles_uei_uel_pair():
+    pipeline = _pipeline_stub()
+    pipeline.config.enable_code_char_classifier = False
+    pipeline.config.enable_code_glyph_width_fallback = False
+    pipeline.config.code_ambiguity_pairs = "O:0,I:L"
+    pipeline._code_pair_map = OCRPipeline._build_bidirectional_pair_map(
+        pipeline.config.code_ambiguity_pairs
+    )
+
+    # In UEL, the last char L should become I when pair-vote supports I.
+    pipeline._extract_char_boxes = lambda _text, _img: {7: (1, 1, 8, 8)}
+    pipeline._crop_char = lambda _img, _box: object()
+    pipeline._predict_pair_tesseract_votes = lambda _glyph, _pair: ({"I": 2, "L": 0}, ["ocr=I@92.0"])
+
+    refined, reason = pipeline._refine_code_zero_o_with_char_classifier(
+        "B-TW-UEL-S18011737",
+        object(),
+    )
+
+    assert refined == "B-TW-UEI-S18011737"
+    assert "classifier(" in reason
+
+
+def test_image_support_rescue_resolves_uei_uel_when_classifier_no_change():
+    pipeline = _pipeline_stub()
+    pipeline.config.enable_code_char_classifier = False
+    pipeline.config.enable_code_glyph_width_fallback = False
+    pipeline.config.enable_code_image_support_rescue = True
+    pipeline.config.code_ambiguity_pairs = "O:0,I:L"
+    pipeline._code_pair_map = OCRPipeline._build_bidirectional_pair_map(
+        pipeline.config.code_ambiguity_pairs
+    )
+
+    pipeline._extract_char_boxes = lambda _text, _img: {7: (1, 1, 8, 8)}
+    pipeline._crop_char = lambda _img, _box: object()
+    pipeline._predict_pair_tesseract_votes = lambda _glyph, _pair: ({}, [])
+    pipeline._collect_ambiguity_support_candidates = (
+        lambda _img: ["B-TW-UEI-S18011737", "B-TW-UEL-S18011737"]
+    )
+
+    refined, reason = pipeline._refine_code_zero_o_with_char_classifier(
+        "B-TW-UEL-S18011737",
+        object(),
+    )
+
+    assert refined == "B-TW-UEI-S18011737"
+    assert reason.startswith("image_support(")

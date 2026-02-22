@@ -480,7 +480,7 @@ class PDFTextExtractorV3:
         alt_preview = "|".join(str(a) for a in alternatives[:3])
 
         logger.warning(
-            f"[AMBIGUITY] Page {page_num}: customer code '{code_segment}' may be O/0 ambiguous "
+            f"[AMBIGUITY] Page {page_num}: customer code '{code_segment}' may be confusable "
             f"(alternatives: {alt_preview})"
         )
         return f"code_ambiguity:{code_segment}->{alt_preview}"

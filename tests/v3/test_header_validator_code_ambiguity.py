@@ -1,4 +1,4 @@
-"""Tests for observe-only code O/0 ambiguity inspection."""
+"""Tests for observe-only code confusable-character ambiguity inspection."""
 
 import sys
 from pathlib import Path
@@ -32,3 +32,14 @@ def test_inspect_code_ambiguity_skips_non_mixed_codes():
     info = validator.inspect_code_ambiguity("B-FD-ABCD-S18020267")
 
     assert info["is_ambiguous"] is False
+
+
+def test_inspect_code_ambiguity_detects_uei_uel_pair():
+    validator = _validator()
+    info = validator.inspect_code_ambiguity("B-TW-UEL-S18011737")
+
+    assert info["enabled"] is True
+    assert info["is_ambiguous"] is True
+    assert info["code_segment"] == "UEL"
+    assert "UEI" in info["alternative_codes"]
+    assert "B-TW-UEI-S18011737" in info["alternative_headers"]

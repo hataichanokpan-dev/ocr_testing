@@ -74,8 +74,13 @@ class OCRPipeline:
             min_confidence=float(getattr(config, "code_char_classifier_min_confidence", 0.72)),
             min_margin=float(getattr(config, "code_char_classifier_min_margin", 0.12)),
         )
-        self._box_alignment_map = self._build_box_alignment_map(
-            str(getattr(config, "code_box_alignment_ambiguity_pairs", "O:0,S:5,F:E"))
+        box_alignment_pairs = self._merge_pair_specs(
+            str(getattr(config, "code_box_alignment_ambiguity_pairs", "O:0,S:5,F:E")),
+            str(getattr(config, "code_ambiguity_pairs", "O:0,I:L")),
+        )
+        self._box_alignment_map = self._build_box_alignment_map(box_alignment_pairs)
+        self._code_pair_map = self._build_bidirectional_pair_map(
+            str(getattr(config, "code_ambiguity_pairs", "O:0,I:L"))
         )
 
         logger.info("OCR Pipeline V3.2 initialized (native V3 methods + PaddleOCR fallback)")
@@ -428,6 +433,69 @@ class OCRPipeline:
                 all_method_results["__meta__"]["glyph_disambiguation_reason"] = reason
                 logger.info(f"[OCR] Code glyph disambiguation skipped: {reason}")
 
+        if bool(getattr(self.config, "enable_code_ambiguity_full_ocr_confirm", True)) and best_text:
+            ambiguity = self.validator.inspect_code_ambiguity(best_text)
+            all_method_results.setdefault("__meta__", {})
+            glyph_reason = str(all_method_results["__meta__"].get("glyph_disambiguation_reason", "") or "")
+            if ambiguity.get("is_ambiguous") and glyph_reason.startswith("classifier_no_change"):
+                confirm_text_raw, confirm_method_results, confirm_freq = self._run_ocr_methods(
+                    disambiguation_img,
+                    context,
+                )
+                confirm_score, confirm_corrected = self.validator.validate_and_score(confirm_text_raw)
+                confirm_text = (confirm_corrected if confirm_corrected else confirm_text_raw) or ""
+                confirm_text = str(confirm_text).strip()
+                confirm_strict = self.validator.is_strict_header(confirm_text)
+
+                if confirm_text and confirm_text != best_text and confirm_strict:
+                    base_support = self._count_non_empty_method_results(all_method_results)
+                    confirm_support = self._count_non_empty_method_results(confirm_method_results)
+                    min_support = max(
+                        1,
+                        int(getattr(self.config, "code_ambiguity_full_ocr_confirm_min_support", 2)),
+                    )
+                    should_apply = False
+                    apply_reason = ""
+
+                    if confirm_score > best_score and confirm_support >= min_support:
+                        should_apply = True
+                        apply_reason = f"higher_score({confirm_score}>{best_score})"
+                    elif confirm_score == best_score:
+                        if confirm_support >= max(base_support + 1, min_support):
+                            should_apply = True
+                            apply_reason = f"higher_support({confirm_support}>{base_support})"
+                        elif (
+                            "no_votes" in glyph_reason
+                            and confirm_support >= min_support
+                            and selected_scale + 1e-6 < float(
+                                getattr(self.config, "code_ambiguity_confirm_scale", self.config.max_render_scale)
+                            )
+                        ):
+                            should_apply = True
+                            apply_reason = "high_scale_no_votes_tiebreak"
+
+                    if should_apply:
+                        logger.warning(
+                            f"[OCR] Ambiguity full confirm: '{best_text}' -> '{confirm_text}' "
+                            f"({apply_reason}, support {base_support}->{confirm_support})"
+                        )
+                        best_text = confirm_text
+                        best_score = confirm_score
+                        best_freq_ratio = max(best_freq_ratio, confirm_freq)
+                        for key, value in confirm_method_results.items():
+                            all_method_results[f"confirm_{key}"] = value
+                        all_method_results["__meta__"]["full_confirm_applied"] = True
+                        all_method_results["__meta__"]["full_confirm_reason"] = apply_reason
+                    else:
+                        all_method_results["__meta__"]["full_confirm_applied"] = False
+                        all_method_results["__meta__"]["full_confirm_reason"] = (
+                            f"no_switch(score={confirm_score},support={confirm_support},base={base_support})"
+                        )
+                        logger.info(
+                            f"[OCR] Ambiguity full confirm skipped: "
+                            f"{all_method_results['__meta__']['full_confirm_reason']}"
+                        )
+
         logger.info(f"[OCR] Final result: '{best_text}' (score: {best_score})")
         return best_text, all_method_results, best_freq_ratio
 
@@ -544,28 +612,50 @@ class OCRPipeline:
         updated = list(code)
         changed = False
         notes: List[str] = []
+        skip_stats: Dict[str, int] = defaultdict(int)
+
+        max_positions = max(1, int(getattr(self.config, "code_char_classifier_max_positions", 4)))
+        inspected = 0
 
         for code_pos, ch in enumerate(code):
-            if ch not in {"0", "O"}:
+            mapped = self._code_pair_map.get(ch)
+            if not mapped:
                 continue
-
-            # Keep leading numeric code token conservative by default.
-            if code_pos == 0 and ch == "0" and not allow_leading:
+            if mapped == ch:
                 continue
 
             global_idx = code_start + code_pos
             box = char_boxes.get(global_idx)
             if not box:
+                skip_stats["missing_box"] += 1
                 continue
 
             glyph = self._crop_char(image, box)
             if glyph is None:
+                skip_stats["missing_glyph"] += 1
                 continue
 
-            votes: Dict[str, int] = {"0": 0, "O": 0}
-            vote_notes: List[str] = []
+            pair_chars = sorted({ch, mapped})
+            if len(pair_chars) != 2:
+                skip_stats["invalid_pair"] += 1
+                continue
+            inspected += 1
+            if inspected > max_positions:
+                break
 
-            if bool(getattr(self.config, "code_char_classifier_enable_width_vote", True)):
+            votes: Dict[str, int] = {pair_chars[0]: 0, pair_chars[1]: 0}
+            vote_notes: List[str] = []
+            pair_key = frozenset(pair_chars)
+
+            # Keep leading numeric code token conservative by default.
+            if code_pos == 0 and ch.isdigit() and mapped.isalpha() and not allow_leading:
+                skip_stats["leading_guard"] += 1
+                continue
+
+            if (
+                pair_key == frozenset({"0", "O"})
+                and bool(getattr(self.config, "code_char_classifier_enable_width_vote", True))
+            ):
                 zero_positions = [i for i, c in enumerate(code) if c == "0"]
                 if len(zero_positions) >= 2:
                     width_values = []
@@ -582,7 +672,7 @@ class OCRPipeline:
                                 votes["O"] += 1
                                 vote_notes.append(f"width=O@{ratio:.2f}")
 
-            if bool(getattr(self.config, "enable_code_char_classifier", True)):
+            if pair_key == frozenset({"0", "O"}) and bool(getattr(self.config, "enable_code_char_classifier", True)):
                 pred = self._zero_o_classifier.predict(glyph)
                 if pred and pred.get("accepted"):
                     predicted = str(pred.get("predicted_char", ""))
@@ -592,28 +682,39 @@ class OCRPipeline:
                             f"svm={predicted}@{float(pred.get('confidence', 0.0)):.2f}"
                         )
 
-            t_char, t_conf = self._predict_zero_o_tesseract(glyph)
-            if t_char in votes:
-                votes[t_char] += 1
-                vote_notes.append(f"ocr={t_char}@{t_conf:.1f}")
+            t_votes, t_notes = self._predict_pair_tesseract_votes(glyph, pair_chars)
+            for c, value in t_votes.items():
+                if c in votes:
+                    votes[c] += int(value)
+            vote_notes.extend(t_notes[:2])
 
             predicted = ch
             predicted_votes = votes.get(ch, 0)
-            for candidate in ("0", "O"):
+            for candidate in pair_chars:
                 count = votes.get(candidate, 0)
                 if count > predicted_votes:
                     predicted = candidate
                     predicted_votes = count
 
-            if predicted not in {"0", "O"} or predicted == ch:
+            if predicted not in votes or predicted == ch:
+                if votes:
+                    top_votes = sorted(votes.values(), reverse=True)
+                    if top_votes[0] <= 0:
+                        skip_stats["no_votes"] += 1
+                    elif len(top_votes) >= 2 and top_votes[0] == top_votes[1]:
+                        skip_stats["tie"] += 1
+                    else:
+                        skip_stats["kept_original"] += 1
                 continue
-            if code_pos == 0 and ch == "0" and predicted == "O" and not allow_leading:
+            if code_pos == 0 and ch.isdigit() and predicted.isalpha() and not allow_leading:
+                skip_stats["leading_guard"] += 1
                 continue
             min_vote_support = max(
                 1,
                 int(getattr(self.config, "code_char_classifier_min_vote_support", 2)),
             )
             if predicted_votes < min_vote_support:
+                skip_stats["below_min_support"] += 1
                 continue
 
             updated[code_pos] = predicted
@@ -632,8 +733,21 @@ class OCRPipeline:
                     return header_text, f"insufficient_evidence({support}<{required})"
             return refined, "classifier(" + ",".join(notes[:3]) + ")"
 
+        if bool(getattr(self.config, "enable_code_image_support_rescue", True)):
+            resolved, resolve_reason = self._resolve_code_ambiguity_by_image_support(
+                header_text=header_text,
+                image=image,
+                ambiguity=ambiguity,
+            )
+            if resolved != header_text:
+                return resolved, resolve_reason
+
         if bool(getattr(self.config, "enable_code_glyph_width_fallback", True)):
             return self._refine_code_zero_o_with_glyph_width(header_text, image)
+        if skip_stats:
+            parts = [f"{key}={value}" for key, value in sorted(skip_stats.items()) if value > 0]
+            if parts:
+                return header_text, f"classifier_no_change({','.join(parts)})"
         return header_text, "classifier_no_change"
 
     def _count_header_support(self, target_header: str, evidence_headers: List[str]) -> int:
@@ -655,64 +769,220 @@ class OCRPipeline:
                 support += 1
         return support
 
+    @staticmethod
+    def _count_non_empty_method_results(method_results: Dict) -> int:
+        """Count OCR method outputs that returned non-empty text (ignore metadata)."""
+        count = 0
+        for key, value in method_results.items():
+            if key == "__meta__":
+                continue
+            if not isinstance(value, dict):
+                continue
+            text = str(value.get("text", "") or "").strip()
+            if text:
+                count += 1
+        return count
+
     def _predict_zero_o_tesseract(self, glyph_img) -> Tuple[str, float]:
         """
         Char-level fallback OCR on a single glyph using whitelist O/0.
+        """
+        votes, notes = self._predict_pair_tesseract_votes(glyph_img, ["0", "O"])
+        if not votes:
+            return "", 0.0
+        best_char = max(votes.items(), key=lambda item: item[1])[0]
+        if votes.get(best_char, 0) <= 0:
+            return "", 0.0
+        best_conf = 0.0
+        for note in notes:
+            if not note.startswith("ocr="):
+                continue
+            # note format: ocr=X@YY.Y
+            try:
+                conf_val = float(note.split("@", 1)[1])
+            except Exception:
+                continue
+            if conf_val > best_conf:
+                best_conf = conf_val
+        return best_char, best_conf
+
+    def _predict_pair_tesseract_votes(
+        self,
+        glyph_img,
+        pair_chars: List[str],
+    ) -> Tuple[Dict[str, int], List[str]]:
+        """
+        OCR votes for a two-character confusable pair using lightweight char OCR.
         """
         try:
             import pytesseract
             import cv2
             import numpy as np
         except Exception:
-            return "", 0.0
+            return {}, []
 
-        if glyph_img is None:
-            return "", 0.0
+        if glyph_img is None or not pair_chars:
+            return {}, []
+
+        if not hasattr(glyph_img, "shape"):
+            return {}, []
 
         gray = glyph_img
         if len(gray.shape) == 3:
             gray = cv2.cvtColor(gray, cv2.COLOR_BGR2GRAY)
         gray = gray.astype(np.uint8)
         _thr, bin_img = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        adaptive_img = cv2.adaptiveThreshold(
+            gray,
+            255,
+            cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+            cv2.THRESH_BINARY,
+            11,
+            2,
+        )
 
-        config = "--psm 10 --oem 3 -c tessedit_char_whitelist=O0"
-        try:
-            text = pytesseract.image_to_string(bin_img, lang="eng", config=config).strip().upper()
-        except Exception:
-            return "", 0.0
-
-        if not text:
-            return "", 0.0
-
-        char = text[0]
-        if char not in {"0", "O"}:
-            return "", 0.0
-
-        confidence = 0.0
-        try:
-            data = pytesseract.image_to_data(
-                bin_img,
-                lang="eng",
-                config=config,
-                output_type=pytesseract.Output.DICT,
-            )
-            conf_values = []
-            for raw in data.get("conf", []):
-                try:
-                    conf = float(raw)
-                except Exception:
-                    continue
-                if conf >= 0:
-                    conf_values.append(conf)
-            if conf_values:
-                confidence = max(conf_values)
-        except Exception:
-            confidence = 0.0
+        whitelist = "".join(sorted(set(ch.upper() for ch in pair_chars if len(ch) == 1)))
+        if len(whitelist) < 2:
+            return {}, []
 
         min_conf = float(getattr(self.config, "code_char_tesseract_confidence_threshold", 72.0))
-        if confidence < min_conf:
-            return "", 0.0
-        return char, confidence
+        votes: Dict[str, int] = {ch: 0 for ch in whitelist}
+        notes: List[str] = []
+
+        variants = [
+            ("bin", bin_img),
+            ("adp", adaptive_img),
+        ]
+        psm_modes = [10, 13]
+        for v_name, variant in variants:
+            for psm in psm_modes:
+                config = f"--psm {psm} --oem 3 -c tessedit_char_whitelist={whitelist}"
+                try:
+                    text = pytesseract.image_to_string(variant, lang="eng", config=config).strip().upper()
+                except Exception:
+                    continue
+                if not text:
+                    continue
+                candidate = text[0]
+                if candidate not in votes:
+                    continue
+
+                confidence = 0.0
+                try:
+                    data = pytesseract.image_to_data(
+                        variant,
+                        lang="eng",
+                        config=config,
+                        output_type=pytesseract.Output.DICT,
+                    )
+                    conf_values = []
+                    for raw in data.get("conf", []):
+                        try:
+                            conf = float(raw)
+                        except Exception:
+                            continue
+                        if conf >= 0:
+                            conf_values.append(conf)
+                    if conf_values:
+                        confidence = max(conf_values)
+                except Exception:
+                    confidence = 0.0
+
+                if confidence < min_conf:
+                    continue
+                votes[candidate] += 1
+                notes.append(f"ocr={candidate}@{confidence:.1f}/{v_name}/psm{psm}")
+
+        return votes, notes
+
+    def _resolve_code_ambiguity_by_image_support(
+        self,
+        header_text: str,
+        image: Optional[Image.Image],
+        ambiguity: Optional[Dict[str, object]] = None,
+    ) -> Tuple[str, str]:
+        """
+        Resolve confusable code variants using extra OCR evidence from the whole header image.
+        """
+        if image is None:
+            return header_text, "image_support_no_image"
+
+        info = ambiguity if ambiguity is not None else self.validator.inspect_code_ambiguity(header_text)
+        if not info or not info.get("is_ambiguous"):
+            return header_text, "image_support_not_ambiguous"
+
+        alternatives = [str(x) for x in info.get("alternative_headers", []) if x]
+        if not alternatives:
+            return header_text, "image_support_no_alternatives"
+
+        candidates = self._collect_ambiguity_support_candidates(image)
+        if not candidates:
+            return header_text, "image_support_no_candidates"
+
+        min_support = max(1, int(getattr(self.config, "code_image_support_min_votes", 1)))
+        resolved, meta = self.validator.resolve_code_ambiguity_by_support(
+            header_text,
+            candidates,
+            min_support=min_support,
+        )
+        if resolved != header_text:
+            return resolved, f"image_support({meta.get('supports', {})})"
+        return header_text, "image_support_no_change"
+
+    def _collect_ambiguity_support_candidates(self, image: Image.Image) -> List[str]:
+        """
+        Collect candidate full-header OCR strings from a few lightweight preprocessing variants.
+        Used only for ambiguous code disambiguation.
+        """
+        try:
+            import cv2
+            import numpy as np
+            import pytesseract
+        except Exception:
+            return []
+
+        try:
+            img_cv = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR)
+            gray = cv2.cvtColor(img_cv, cv2.COLOR_BGR2GRAY)
+            _thr, bin_img = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+            adaptive = cv2.adaptiveThreshold(
+                gray,
+                255,
+                cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                cv2.THRESH_BINARY,
+                11,
+                2,
+            )
+        except Exception:
+            return []
+
+        variants = [
+            ("bin", bin_img),
+            ("adp", adaptive),
+            ("gray", gray),
+        ]
+        psm_modes = [7, 6, 13]
+        whitelist = self.config.tesseract_char_whitelist or "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-"
+        max_attempts = max(1, int(getattr(self.config, "code_image_support_max_attempts", 6)))
+
+        candidates: List[str] = []
+        attempts = 0
+        for _v_name, variant in variants:
+            for psm in psm_modes:
+                config = f"--psm {psm} --oem 3 -c tessedit_char_whitelist={whitelist}"
+                try:
+                    text = pytesseract.image_to_string(variant, lang="eng", config=config).strip().upper()
+                except Exception:
+                    continue
+                if text:
+                    candidates.append(text)
+                attempts += 1
+                if attempts >= max_attempts:
+                    break
+            if attempts >= max_attempts:
+                break
+
+        return candidates
 
     def _refine_code_zero_o_with_glyph_width(
         self,
@@ -955,6 +1225,55 @@ class OCRPipeline:
             mapping[right] = right
         return mapping
 
+    @staticmethod
+    def _merge_pair_specs(primary: str, secondary: str) -> str:
+        """
+        Merge pair specs like "O:0,S:5" + "I:L,O:0" -> "O:0,S:5,I:L".
+        Preserves the first occurrence order to keep canonical mapping stable.
+        """
+        merged: List[str] = []
+        seen = set()
+        for source in (primary, secondary):
+            for token in str(source or "").split(","):
+                pair = token.strip().upper()
+                if not pair:
+                    continue
+                if ":" not in pair:
+                    continue
+                left, right = pair.split(":", 1)
+                left = left.strip()
+                right = right.strip()
+                if len(left) != 1 or len(right) != 1:
+                    continue
+                normalized = f"{left}:{right}"
+                if normalized in seen:
+                    continue
+                seen.add(normalized)
+                merged.append(normalized)
+        return ",".join(merged)
+
+    @staticmethod
+    def _build_bidirectional_pair_map(raw_pairs: str) -> Dict[str, str]:
+        """
+        Build bidirectional char-pair map from config (A:B,C:D).
+        """
+        mapping: Dict[str, str] = {}
+        if not raw_pairs:
+            return mapping
+
+        for token in str(raw_pairs).split(","):
+            pair = token.strip().upper()
+            if ":" not in pair:
+                continue
+            left, right = pair.split(":", 1)
+            left = left.strip()
+            right = right.strip()
+            if len(left) != 1 or len(right) != 1:
+                continue
+            mapping[left] = right
+            mapping[right] = left
+        return mapping
+
     def _crop_char(
         self,
         image: Image.Image,
@@ -1124,6 +1443,15 @@ class OCRPipeline:
 
         attempts = 0
         early_exit = False
+        min_early_exit_attempts = max(
+            1,
+            int(getattr(self.config, "ocr_method_early_exit_min_attempts", 2)),
+        )
+        min_early_exit_confirmations = max(
+            1,
+            int(getattr(self.config, "ocr_method_early_exit_min_confirmations", 2)),
+        )
+        strong_text_counts: Counter = Counter()
         for psm_mode, custom_config in tesseract_configs:
             for method_name, method_func in methods:
                 if attempts >= self.config.max_ocr_attempts:
@@ -1154,11 +1482,18 @@ class OCRPipeline:
                             score >= self.config.early_exit_score
                             and confidence >= self.config.tesseract_confidence_threshold
                         ):
-                            logger.debug(
-                                f"{method_key} got excellent result (score={score}, conf={confidence:.1f}%)"
-                            )
-                            early_exit = True
-                            break
+                            strong_text_counts[text] += 1
+                            confirmations = strong_text_counts[text]
+                            if (
+                                attempts >= min_early_exit_attempts
+                                and confirmations >= min_early_exit_confirmations
+                            ):
+                                logger.debug(
+                                    f"{method_key} got repeated excellent result "
+                                    f"(score={score}, conf={confidence:.1f}%, confirmations={confirmations})"
+                                )
+                                early_exit = True
+                                break
                     else:
                         method_results[method_key] = {
                             "text": "",
