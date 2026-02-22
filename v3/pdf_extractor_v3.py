@@ -188,7 +188,8 @@ class PDFTextExtractorV3:
                         ocr_method=ocr_info.get('method', 'unknown'),
                         processing_time_ms=processing_time_ms,
                         render_scale=ocr_info.get('render_scale', 2.0),
-                        status='success' if ocr_info.get('confidence_score', 0) >= 130 else 'low_confidence'
+                        status='success' if ocr_info.get('confidence_score', 0) >= 130 else 'low_confidence',
+                        quality_flags=ocr_info.get('quality_flags', '')
                     )
                 else:
                     # Record failed extraction
@@ -201,7 +202,8 @@ class PDFTextExtractorV3:
                         processing_time_ms=processing_time_ms,
                         render_scale=2.0,
                         status='error',
-                        error_message='No header extracted'
+                        error_message='No header extracted',
+                        quality_flags=ocr_info.get('quality_flags', '')
                     )
             
             doc.close()
@@ -229,7 +231,11 @@ class PDFTextExtractorV3:
                 'headers_extracted': len(page_headers),
                 'split_pdfs_created': len(split_results),
                 'processing_time_seconds': metrics.processing_time_seconds if metrics else 0,
-                'avg_confidence': sum(r.confidence_score for r in self.csv_reporter.pending_records) / len(self.csv_reporter.pending_records) if self.csv_reporter.pending_records else 0
+                'avg_confidence': sum(r.confidence_score for r in self.csv_reporter.pending_records) / len(self.csv_reporter.pending_records) if self.csv_reporter.pending_records else 0,
+                'code_ambiguity_pages': sum(
+                    1 for r in self.csv_reporter.pending_records
+                    if 'code_ambiguity:' in (r.quality_flags or '')
+                )
             }
             
             # Filter error/low-confidence records BEFORE flushing
@@ -301,7 +307,8 @@ class PDFTextExtractorV3:
         ocr_info = {
             'confidence_score': 0,
             'method': 'unknown',
-            'render_scale': 2.0
+            'render_scale': 2.0,
+            'quality_flags': ''
         }
         
         try:
@@ -329,6 +336,9 @@ class PDFTextExtractorV3:
                     logger.info(f"[DIRECT] Got '{corrected}' (score: {score})")
                     ocr_info['confidence_score'] = score
                     ocr_info['method'] = 'direct'
+                    ambiguity_flag = self._build_code_ambiguity_flag(corrected, page_num)
+                    if ambiguity_flag:
+                        ocr_info['quality_flags'] = ambiguity_flag
                     return corrected, ocr_info
                 logger.debug(
                     f"[DIRECT] Rejected non-strict header '{corrected}' "
@@ -353,6 +363,9 @@ class PDFTextExtractorV3:
                 ocr_info['method'] = list(method_results.keys())[0] if method_results else 'unknown'
                 # Get render scale from context (default to 2.0)
                 ocr_info['render_scale'] = 2.0  # Would need to track this from adaptive rendering
+                ambiguity_flag = self._build_code_ambiguity_flag(text, page_num)
+                if ambiguity_flag:
+                    ocr_info['quality_flags'] = ambiguity_flag
             
             # Log to API
             if self.config.enable_api_logging:
@@ -381,6 +394,24 @@ class PDFTextExtractorV3:
                 )
             
             return "", ocr_info
+
+    def _build_code_ambiguity_flag(self, header_text: str, page_num: int) -> str:
+        """
+        Build observe-only quality flag for code O/0 ambiguity.
+        """
+        ambiguity = self.validator.inspect_code_ambiguity(header_text)
+        if not ambiguity.get('is_ambiguous'):
+            return ""
+
+        code_segment = str(ambiguity.get('code_segment', ''))
+        alternatives = ambiguity.get('alternative_codes', []) or []
+        alt_preview = "|".join(str(a) for a in alternatives[:3])
+
+        logger.warning(
+            f"[AMBIGUITY] Page {page_num}: customer code '{code_segment}' may be O/0 ambiguous "
+            f"(alternatives: {alt_preview})"
+        )
+        return f"code_ambiguity:{code_segment}->{alt_preview}"
     
     def shutdown(self):
         """Gracefully shutdown extractor"""

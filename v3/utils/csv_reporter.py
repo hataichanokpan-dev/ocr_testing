@@ -35,6 +35,7 @@ class ExtractionRecord:
     render_scale: float
     status: str  # success, low_confidence, error
     error_message: str = ""
+    quality_flags: str = ""
     split_group: str = ""  # Which split PDF it belongs to
     output_filename: str = ""
     
@@ -98,6 +99,7 @@ class CSVReporter:
         render_scale: float = 2.0,
         status: str = "success",
         error_message: str = "",
+        quality_flags: str = "",
         split_group: str = "",
         output_filename: str = ""
     ):
@@ -132,6 +134,7 @@ class CSVReporter:
             render_scale=render_scale,
             status=status,
             error_message=error_message,
+            quality_flags=quality_flags,
             split_group=split_group,
             output_filename=output_filename
         )

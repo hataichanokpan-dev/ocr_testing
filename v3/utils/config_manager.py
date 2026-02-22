@@ -134,6 +134,17 @@ class ExtractionConfig:
     ambiguous_characters: str = 'S:5,B:8,P:F,O:0,I:1,Z:2'
     character_whitelist: str = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-'
     enable_ensemble_voting: bool = True
+
+    # Code ambiguity monitoring (observe-only, V3.3)
+    enable_code_ambiguity_monitor: bool = True
+    code_ambiguity_pairs: str = 'O:0'
+    code_ambiguity_only_mixed_alnum: bool = True
+    enable_code_ambiguity_autocorrect: bool = True
+    code_autocorrect_min_support: int = 1
+    code_autocorrect_require_scale_evidence: bool = True
+    code_autocorrect_force_multi_scale: bool = True
+    enable_code_glyph_disambiguation: bool = True
+    code_zero_to_o_width_ratio: float = 1.12
     
     def __post_init__(self):
         """Validate configuration after initialization"""
@@ -308,6 +319,17 @@ class ConfigManager:
             ambiguous_characters=settings.get('ambiguous_characters', 'S:5,B:8,P:F,O:0,I:1,Z:2'),
             character_whitelist=settings.get('character_whitelist', 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-'),
             enable_ensemble_voting=settings.getboolean('enable_ensemble_voting', True),
+
+            # Code ambiguity monitoring (observe-only)
+            enable_code_ambiguity_monitor=settings.getboolean('enable_code_ambiguity_monitor', True),
+            code_ambiguity_pairs=settings.get('code_ambiguity_pairs', 'O:0'),
+            code_ambiguity_only_mixed_alnum=settings.getboolean('code_ambiguity_only_mixed_alnum', True),
+            enable_code_ambiguity_autocorrect=settings.getboolean('enable_code_ambiguity_autocorrect', True),
+            code_autocorrect_min_support=settings.getint('code_autocorrect_min_support', 1),
+            code_autocorrect_require_scale_evidence=settings.getboolean('code_autocorrect_require_scale_evidence', True),
+            code_autocorrect_force_multi_scale=settings.getboolean('code_autocorrect_force_multi_scale', True),
+            enable_code_glyph_disambiguation=settings.getboolean('enable_code_glyph_disambiguation', True),
+            code_zero_to_o_width_ratio=settings.getfloat('code_zero_to_o_width_ratio', 1.12),
         )
         
         logger.info(f"Configuration loaded from: {config_path}")

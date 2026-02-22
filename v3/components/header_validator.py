@@ -5,7 +5,7 @@ HeaderValidator - validate, normalize, and compare extracted headers.
 import logging
 import re
 from difflib import SequenceMatcher
-from typing import Dict, Tuple
+from typing import Dict, List, Optional, Tuple
 
 from v3.utils.config_manager import ExtractionConfig
 
@@ -303,3 +303,192 @@ class HeaderValidator:
             if len(src) == 1 and len(dst) == 1:
                 result[src] = dst
         return result
+
+    def inspect_code_ambiguity(self, text: str) -> Dict[str, object]:
+        """
+        Inspect OCR ambiguity in customer code segment (observe-only).
+
+        Returns:
+            dict with keys:
+            - enabled
+            - is_ambiguous
+            - normalized_header
+            - code_segment
+            - alternative_codes
+            - alternative_headers
+            - note
+        """
+        result: Dict[str, object] = {
+            "enabled": bool(getattr(self.config, "enable_code_ambiguity_monitor", True)),
+            "is_ambiguous": False,
+            "normalized_header": "",
+            "code_segment": "",
+            "alternative_codes": [],
+            "alternative_headers": [],
+            "note": "",
+        }
+
+        if not result["enabled"]:
+            result["note"] = "monitor_disabled"
+            return result
+
+        _, normalized = self.validate_and_score(text)
+        if not normalized:
+            result["note"] = "empty_normalized"
+            return result
+
+        result["normalized_header"] = normalized
+        parts = normalized.split(self.config.expected_separator)
+        code_idx = self._resolve_code_segment_index(parts)
+        if code_idx is None:
+            result["note"] = "unsupported_format"
+            return result
+
+        code = parts[code_idx]
+        result["code_segment"] = code
+
+        if not code:
+            result["note"] = "empty_code"
+            return result
+
+        only_mixed = bool(getattr(self.config, "code_ambiguity_only_mixed_alnum", True))
+        has_alpha = any(ch.isalpha() for ch in code)
+        has_digit = any(ch.isdigit() for ch in code)
+        if only_mixed and not (has_alpha and has_digit):
+            result["note"] = "not_mixed_alnum"
+            return result
+
+        pairs = self._parse_bidirectional_ambiguity_pairs(
+            getattr(self.config, "code_ambiguity_pairs", "O:0")
+        )
+        if not pairs:
+            result["note"] = "no_pairs"
+            return result
+
+        alt_codes = self._build_single_char_ambiguity_variants(code, pairs)
+        if not alt_codes:
+            result["note"] = "no_variant"
+            return result
+
+        alt_headers: List[str] = []
+        for alt_code in alt_codes:
+            alt_parts = list(parts)
+            alt_parts[code_idx] = alt_code
+            alt_headers.append(self.config.expected_separator.join(alt_parts))
+
+        result["is_ambiguous"] = True
+        result["alternative_codes"] = alt_codes
+        result["alternative_headers"] = alt_headers
+        result["note"] = "code_o0_ambiguous"
+        return result
+
+    def _resolve_code_segment_index(self, parts: List[str]) -> Optional[int]:
+        """Resolve likely customer code segment index based on header part count."""
+        if len(parts) == self.config.expected_parts:
+            return 2
+        if len(parts) == self.config.min_expected_parts:
+            return 1
+        return None
+
+    def _build_single_char_ambiguity_variants(self, text: str, mapping: Dict[str, str]) -> List[str]:
+        """
+        Build single-position variants for configured ambiguity pairs.
+        Example: 020H with O:0 -> O20H, 02OH
+        """
+        variants: List[str] = []
+        seen = set()
+        for idx, ch in enumerate(text):
+            mapped = mapping.get(ch)
+            if not mapped:
+                continue
+            variant = f"{text[:idx]}{mapped}{text[idx + 1:]}"
+            if variant == text:
+                continue
+            if variant in seen:
+                continue
+            seen.add(variant)
+            variants.append(variant)
+        return variants
+
+    def _parse_bidirectional_ambiguity_pairs(self, mapping: str) -> Dict[str, str]:
+        """
+        Parse ambiguity map and make it bidirectional.
+        Example: O:0 -> O->0 and 0->O
+        """
+        pairs: Dict[str, str] = {}
+        if not mapping:
+            return pairs
+
+        for token in mapping.split(","):
+            raw = token.strip().upper()
+            if ":" not in raw:
+                continue
+            left, right = raw.split(":", 1)
+            left = left.strip()
+            right = right.strip()
+            if len(left) != 1 or len(right) != 1:
+                continue
+            pairs[left] = right
+            pairs[right] = left
+        return pairs
+
+    def resolve_code_ambiguity_by_support(
+        self,
+        base_header: str,
+        candidate_headers: List[str],
+        min_support: int = 1,
+    ) -> Tuple[str, Dict[str, object]]:
+        """
+        Resolve code ambiguity using candidate support evidence.
+
+        Args:
+            base_header: Current selected header
+            candidate_headers: Candidate headers from OCR methods/scales
+            min_support: Minimum candidate support to accept alternative
+
+        Returns:
+            (resolved_header, metadata)
+        """
+        info = self.inspect_code_ambiguity(base_header)
+        metadata: Dict[str, object] = {
+            "applied": False,
+            "base_header": base_header,
+            "resolved_header": base_header,
+            "supports": {},
+            "min_support": max(1, int(min_support)),
+            "reason": "no_ambiguity",
+        }
+
+        if not info.get("is_ambiguous"):
+            return base_header, metadata
+
+        normalized_candidates: List[str] = []
+        for candidate in candidate_headers:
+            if not candidate:
+                continue
+            _, normalized = self.validate_and_score(candidate)
+            normalized_candidates.append(normalized if normalized else candidate)
+
+        alternatives = [str(x) for x in info.get("alternative_headers", []) if x]
+        if not alternatives:
+            metadata["reason"] = "no_alternative_headers"
+            return base_header, metadata
+
+        support_map: Dict[str, int] = {alt: 0 for alt in alternatives}
+        for candidate in normalized_candidates:
+            if candidate in support_map:
+                support_map[candidate] += 1
+
+        metadata["supports"] = support_map
+        best_alt = max(support_map.items(), key=lambda item: item[1])
+        best_header, best_support = best_alt[0], best_alt[1]
+        required = metadata["min_support"]
+
+        if best_support >= required:
+            metadata["applied"] = True
+            metadata["resolved_header"] = best_header
+            metadata["reason"] = f"support={best_support}"
+            return best_header, metadata
+
+        metadata["reason"] = f"insufficient_support={best_support}"
+        return base_header, metadata
